@@ -1,0 +1,11 @@
+services:
+  server:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=3000
+      - EXTERNAL_URL=http://localhost:3000
+      - CREDENTIAL_ISSUER_NAME=OID4VC-RS Development Issuer
+      - RUST_LOG=oid4vc_server=info,tower_http=info

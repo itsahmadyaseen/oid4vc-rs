@@ -1,0 +1,23 @@
+[package]
+name = "oid4vc-verifier"
+description = "OpenID4VP Verifier — authorization requests, DCQL, vp_token verification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+oid4vc-types = { workspace = true }
+oid4vc-crypto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

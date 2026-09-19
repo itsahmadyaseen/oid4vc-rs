@@ -1,0 +1,37 @@
+[package]
+name = "oid4vc-server"
+description = "Axum HTTP server for OID4VCI Issuer and OID4VP Verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "oid4vc-server"
+path = "src/main.rs"
+
+[dependencies]
+oid4vc-types = { workspace = true }
+oid4vc-crypto = { workspace = true }
+oid4vc-issuer = { workspace = true }
+oid4vc-verifier = { workspace = true }
+oid4vc-status = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
+anyhow = "1.0"
+
+[dev-dependencies]
+tokio-test = { workspace = true }

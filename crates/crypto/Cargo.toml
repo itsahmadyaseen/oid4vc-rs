@@ -1,0 +1,29 @@
+[package]
+name = "oid4vc-crypto"
+description = "Cryptographic operations: ECDSA P-256, Ed25519, JWS, SD-JWT, COSE for OID4VC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+oid4vc-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+p256 = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+hmac = { workspace = true }
+jsonwebtoken = { workspace = true }
+base64ct = { workspace = true }
+ciborium = { workspace = true }
+coset = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
