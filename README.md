@@ -62,7 +62,7 @@ graph TB
 | Format | Status | Spec |
 |--------|--------|------|
 | **SD-JWT VC** | ✅ Implemented | [RFC 9901](https://datatracker.ietf.org/doc/rfc9901/) |
-| **ISO 18013-5 mdoc** | ✅ Implemented | [ISO/IEC 18013-5](https://www.iso.org/standard/69084.html) |
+| **ISO 18013-5 mdoc** | ◐ Partial — COSE_Sign1 + MSO digests | [ISO/IEC 18013-5](https://www.iso.org/standard/69084.html) |
 | JWT-VC | ○ Planned | [W3C VC Data Model](https://www.w3.org/TR/vc-data-model-2.0/) |
 
 ---
