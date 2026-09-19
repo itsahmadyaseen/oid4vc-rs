@@ -56,22 +56,34 @@ pub fn compute_element_digest(digest_id: u64, element: &DataElement) -> Result<V
         .map_err(|e| CoseError::CborDeserialization(e.to_string()))?;
 
     let map = vec![
-        (ciborium::Value::Text("digestID".to_string()), ciborium::Value::Integer(digest_id.into())),
-        (ciborium::Value::Text("random".to_string()), ciborium::Value::Bytes(element.random.clone())),
-        (ciborium::Value::Text("elementIdentifier".to_string()), ciborium::Value::Text(element.identifier.clone())),
-        (ciborium::Value::Text("elementValue".to_string()), element_value),
+        (
+            ciborium::Value::Text("digestID".to_string()),
+            ciborium::Value::Integer(digest_id.into()),
+        ),
+        (
+            ciborium::Value::Text("random".to_string()),
+            ciborium::Value::Bytes(element.random.clone()),
+        ),
+        (
+            ciborium::Value::Text("elementIdentifier".to_string()),
+            ciborium::Value::Text(element.identifier.clone()),
+        ),
+        (
+            ciborium::Value::Text("elementValue".to_string()),
+            element_value,
+        ),
     ];
 
     let item = ciborium::Value::Map(map);
-    
+
     // According to ISO 18013-5, the digest is computed over IssuerSignedItemBytes
     // IssuerSignedItemBytes = #6.24(bstr .cbor IssuerSignedItem)
     let mut inner_bytes = Vec::new();
     ciborium::into_writer(&item, &mut inner_bytes)
         .map_err(|e| CoseError::CborSerialization(e.to_string()))?;
-        
+
     let tagged_item = ciborium::Value::Tag(24, Box::new(ciborium::Value::Bytes(inner_bytes)));
-    
+
     let mut item_bytes = Vec::new();
     ciborium::into_writer(&tagged_item, &mut item_bytes)
         .map_err(|e| CoseError::CborSerialization(e.to_string()))?;
@@ -110,7 +122,11 @@ pub fn sign_cose_sign1(
 ) -> Result<Vec<u8>, CoseError> {
     // Build protected header
     let mut protected_map = vec![];
-    let alg_id = if key.algorithm().as_str() == "ES256" { -7 } else { -8 };
+    let alg_id = if key.algorithm().as_str() == "ES256" {
+        -7
+    } else {
+        -8
+    };
     protected_map.push((
         ciborium::Value::Integer(1.into()), // alg label
         ciborium::Value::Integer(alg_id.into()),
@@ -121,7 +137,7 @@ pub fn sign_cose_sign1(
             ciborium::Value::Text(ct.to_string()),
         ));
     }
-    
+
     let protected = ciborium::Value::Map(protected_map);
     let mut protected_bytes = Vec::new();
     ciborium::into_writer(&protected, &mut protected_bytes)
@@ -134,7 +150,7 @@ pub fn sign_cose_sign1(
         ciborium::Value::Bytes(Vec::new()), // empty external_aad
         ciborium::Value::Bytes(payload.to_vec()),
     ]);
-    
+
     let mut to_sign = Vec::new();
     ciborium::into_writer(&sig_structure, &mut to_sign)
         .map_err(|e| CoseError::CborSerialization(e.to_string()))?;
@@ -151,14 +167,14 @@ pub fn sign_cose_sign1(
         ciborium::Value::Bytes(payload.to_vec()),
         ciborium::Value::Bytes(signature),
     ]);
-    
+
     // COSE_Sign1 tag is 18
     let tagged_cose_sign1 = ciborium::Value::Tag(18, Box::new(cose_sign1));
 
     let mut result = Vec::new();
     ciborium::into_writer(&tagged_cose_sign1, &mut result)
         .map_err(|e| CoseError::CborSerialization(e.to_string()))?;
-        
+
     Ok(result)
 }
 
@@ -175,7 +191,7 @@ mod tests {
     fn test_compute_element_digest() {
         let mut value_bytes = Vec::new();
         ciborium::into_writer(&ciborium::Value::Text("Doe".to_string()), &mut value_bytes).unwrap();
-        
+
         let element = DataElement {
             identifier: "family_name".to_string(),
             value: value_bytes,
@@ -196,7 +212,7 @@ mod tests {
         ciborium::into_writer(&ciborium::Value::Text("Doe".to_string()), &mut value1).unwrap();
         let mut value2 = Vec::new();
         ciborium::into_writer(&ciborium::Value::Text("John".to_string()), &mut value2).unwrap();
-        
+
         let elements = vec![
             DataElement {
                 identifier: "family_name".to_string(),
