@@ -119,10 +119,11 @@ fn build_token_response(state: &dyn IssuerState) -> Result<TokenResponse, TokenE
     let access_token = Uuid::new_v4().to_string();
     let c_nonce = Uuid::new_v4().to_string();
     let c_nonce_expires_in = 300u64; // 5 minutes
+    let access_token_expires_in = 3600u64; // 1 hour
 
-    // Store the access token
+    // Store the access token with the same lifetime advertised to the client.
     state
-        .store_access_token(&access_token)
+        .store_access_token(&access_token, access_token_expires_in)
         .map_err(|e| TokenError::StateError(e.to_string()))?;
 
     // Store the c_nonce
@@ -133,7 +134,7 @@ fn build_token_response(state: &dyn IssuerState) -> Result<TokenResponse, TokenE
     Ok(TokenResponse {
         access_token,
         token_type: "Bearer".to_string(),
-        expires_in: 3600,
+        expires_in: access_token_expires_in,
         c_nonce: Some(c_nonce),
         c_nonce_expires_in: Some(c_nonce_expires_in),
         authorization_details: None,

@@ -121,6 +121,54 @@ pub struct Logo {
 }
 
 // ---------------------------------------------------------------------------
+// Authorization Server Metadata (RFC 8414)
+// ---------------------------------------------------------------------------
+
+/// Metadata published at `/.well-known/oauth-authorization-server`.
+///
+/// When `CredentialIssuerMetadata::authorization_servers` is absent the
+/// Credential Issuer is its own Authorization Server, and the wallet discovers
+/// the token and authorization endpoints here. Without this document a wallet
+/// has no way to find them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizationServerMetadata {
+    /// The authorization server's issuer identifier.
+    pub issuer: Url,
+
+    /// URL of the Authorization Endpoint.
+    pub authorization_endpoint: Url,
+
+    /// URL of the Token Endpoint.
+    pub token_endpoint: Url,
+
+    /// URL of the Pushed Authorization Request Endpoint (RFC 9126).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pushed_authorization_request_endpoint: Option<Url>,
+
+    /// Whether PAR is mandatory for authorization requests.
+    pub require_pushed_authorization_requests: bool,
+
+    /// URL of the JWK Set document.
+    pub jwks_uri: Url,
+
+    /// OAuth `response_type` values supported.
+    pub response_types_supported: Vec<String>,
+
+    /// OAuth `grant_type` values supported.
+    pub grant_types_supported: Vec<String>,
+
+    /// PKCE challenge methods supported.
+    pub code_challenge_methods_supported: Vec<String>,
+
+    /// Client authentication methods supported at the Token Endpoint.
+    pub token_endpoint_auth_methods_supported: Vec<String>,
+
+    /// Whether the pre-authorized code grant works without client authentication.
+    #[serde(rename = "pre-authorized_grant_anonymous_access_supported")]
+    pub pre_authorized_grant_anonymous_access_supported: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Credential Offer (§4.1)
 // ---------------------------------------------------------------------------
 

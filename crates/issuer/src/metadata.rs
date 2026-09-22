@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use oid4vc_types::oid4vci::{
-    CredentialConfiguration, CredentialIssuerMetadata, IssuerDisplay, ProofTypeMetadata,
+    AuthorizationServerMetadata, CredentialConfiguration, CredentialIssuerMetadata, IssuerDisplay,
+    ProofTypeMetadata,
 };
 use url::Url;
 
@@ -14,6 +15,16 @@ use url::Url;
 pub struct MetadataConfig {
     pub issuer_url: Url,
     pub issuer_name: String,
+}
+
+impl MetadataConfig {
+    /// The issuer identifier without a trailing slash.
+    ///
+    /// `Url` renders a bare origin as `https://host/`, so interpolating it
+    /// directly yields `https://host//credentials/...`.
+    fn issuer_id(&self) -> &str {
+        self.issuer_url.as_str().trim_end_matches('/')
+    }
 }
 
 /// Build the credential issuer metadata from configuration.
@@ -52,7 +63,7 @@ pub fn build_metadata(config: &MetadataConfig) -> CredentialIssuerMetadata {
                 background_color: Some("#1a1a2e".to_string()),
                 text_color: Some("#ffffff".to_string()),
             }]),
-            vct: Some(format!("{}/credentials/identity", config.issuer_url)),
+            vct: Some(format!("{}/credentials/identity", config.issuer_id())),
             doctype: None,
             claims: None,
         },
@@ -115,6 +126,31 @@ pub fn build_metadata(config: &MetadataConfig) -> CredentialIssuerMetadata {
     }
 }
 
+/// Build the OAuth 2.0 Authorization Server metadata (RFC 8414).
+///
+/// This issuer acts as its own Authorization Server, so it must publish the
+/// token, authorization and PAR endpoints here for wallets to discover.
+pub fn build_authorization_server_metadata(config: &MetadataConfig) -> AuthorizationServerMetadata {
+    let join = |path: &str| config.issuer_url.join(path).expect("valid URL join");
+
+    AuthorizationServerMetadata {
+        issuer: config.issuer_url.clone(),
+        authorization_endpoint: join("/authorize"),
+        token_endpoint: join("/token"),
+        pushed_authorization_request_endpoint: Some(join("/authorize/par")),
+        require_pushed_authorization_requests: true,
+        jwks_uri: join("/.well-known/jwks.json"),
+        response_types_supported: vec!["code".to_string()],
+        grant_types_supported: vec![
+            "authorization_code".to_string(),
+            "urn:ietf:params:oauth:grant-type:pre-authorized_code".to_string(),
+        ],
+        code_challenge_methods_supported: vec!["S256".to_string()],
+        token_endpoint_auth_methods_supported: vec!["none".to_string()],
+        pre_authorized_grant_anonymous_access_supported: true,
+    }
+}
+
 /// Validate that a credential configuration ID exists in the metadata.
 pub fn validate_credential_config<'a>(
     metadata: &'a CredentialIssuerMetadata,
@@ -150,6 +186,39 @@ mod tests {
         assert!(metadata
             .credential_configurations_supported
             .contains_key("mDL_mso_mdoc"));
+    }
+
+    #[test]
+    fn test_vct_has_no_double_slash() {
+        let config = MetadataConfig {
+            issuer_url: Url::parse("https://issuer.example.com").unwrap(),
+            issuer_name: "Test".to_string(),
+        };
+        let metadata = build_metadata(&config);
+
+        let vct = metadata.credential_configurations_supported["IdentityCredential_SD_JWT_VC"]
+            .vct
+            .as_ref()
+            .unwrap();
+        assert_eq!(vct, "https://issuer.example.com/credentials/identity");
+    }
+
+    #[test]
+    fn test_authorization_server_metadata_endpoints() {
+        let config = MetadataConfig {
+            issuer_url: Url::parse("https://issuer.example.com").unwrap(),
+            issuer_name: "Test".to_string(),
+        };
+        let as_metadata = build_authorization_server_metadata(&config);
+
+        assert_eq!(
+            as_metadata.token_endpoint.as_str(),
+            "https://issuer.example.com/token"
+        );
+        assert!(as_metadata
+            .grant_types_supported
+            .contains(&"urn:ietf:params:oauth:grant-type:pre-authorized_code".to_string()));
+        assert_eq!(as_metadata.code_challenge_methods_supported, vec!["S256"]);
     }
 
     #[test]

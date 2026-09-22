@@ -28,6 +28,8 @@ pub enum SdJwtError {
     Verification(String),
     #[error("missing required claim: {0}")]
     MissingClaim(String),
+    #[error("key binding error: {0}")]
+    KeyBinding(String),
 }
 
 /// A disclosure: `[salt, claim_name, claim_value]`.
@@ -205,16 +207,41 @@ pub fn issue_sd_jwt_vc(
     Ok((parts.join("~"), disclosures))
 }
 
+/// The outcome of verifying an SD-JWT VC.
+#[derive(Debug, Clone)]
+pub struct VerifiedSdJwtVc {
+    /// The reconstructed claim set (disclosed + always-visible claims).
+    pub claims: HashMap<String, Value>,
+    /// The full issuer JWT payload, including `cnf`, `status`, `vct` and timestamps.
+    pub payload: Value,
+}
+
+impl VerifiedSdJwtVc {
+    /// The holder's confirmation key (`cnf.jwk`), if the credential is key-bound.
+    pub fn holder_jwk(&self) -> Option<crate::jwk::Jwk> {
+        self.payload
+            .get("cnf")
+            .and_then(|cnf| cnf.get("jwk"))
+            .and_then(|jwk| serde_json::from_value(jwk.clone()).ok())
+    }
+
+    /// The credential's `vct` (Verifiable Credential Type).
+    pub fn vct(&self) -> Option<&str> {
+        self.payload.get("vct").and_then(|v| v.as_str())
+    }
+}
+
 /// Verify an SD-JWT VC and reconstruct disclosed claims.
 ///
-/// Returns the reconstructed claims map after verifying:
+/// Returns the reconstructed claims after verifying:
 /// 1. The issuer JWT signature
-/// 2. Each disclosure hash matches the `_sd` array
-/// 3. No duplicate disclosures
+/// 2. That the credential is within its validity window (`nbf` / `exp`)
+/// 3. Each disclosure hash matches the `_sd` array
+/// 4. No duplicate disclosures
 pub fn verify_sd_jwt_vc(
     sd_jwt: &str,
     issuer_key: &dyn KeyPair,
-) -> Result<HashMap<String, Value>, SdJwtError> {
+) -> Result<VerifiedSdJwtVc, SdJwtError> {
     let parsed = oid4vc_types::credentials::SdJwtVc::parse(sd_jwt)
         .map_err(|e| SdJwtError::Verification(e.to_string()))?;
 
@@ -225,6 +252,23 @@ pub fn verify_sd_jwt_vc(
     // Parse the payload
     let payload: Value = serde_json::from_slice(&decoded.payload)
         .map_err(|e| SdJwtError::Verification(e.to_string()))?;
+
+    // Check the validity window
+    let now = chrono::Utc::now().timestamp();
+    if let Some(exp) = payload.get("exp").and_then(|v| v.as_i64()) {
+        if now >= exp {
+            return Err(SdJwtError::Verification(
+                "credential has expired".to_string(),
+            ));
+        }
+    }
+    if let Some(nbf) = payload.get("nbf").and_then(|v| v.as_i64()) {
+        if now < nbf {
+            return Err(SdJwtError::Verification(
+                "credential is not yet valid".to_string(),
+            ));
+        }
+    }
 
     // Get the _sd array
     let sd_array: Vec<String> = payload
@@ -274,7 +318,106 @@ pub fn verify_sd_jwt_vc(
         }
     }
 
-    Ok(disclosed_claims)
+    Ok(VerifiedSdJwtVc {
+        claims: disclosed_claims,
+        payload,
+    })
+}
+
+/// Compute the `sd_hash` binding value for an SD-JWT presentation.
+///
+/// Per SD-JWT §4.3 this is the base64url-encoded SHA-256 over the presentation
+/// up to and including the final `~` that precedes the KB-JWT.
+pub fn compute_sd_hash(presentation_without_kb: &str) -> String {
+    let base = match presentation_without_kb.rfind('~') {
+        Some(idx) => &presentation_without_kb[..=idx],
+        None => presentation_without_kb,
+    };
+    Base64UrlUnpadded::encode_string(&Sha256::digest(base.as_bytes()))
+}
+
+/// Verify the Key Binding JWT of an SD-JWT VC presentation.
+///
+/// Proves the presenter holds the private key named by the credential's `cnf`
+/// claim, and that this presentation was made for this verifier and this nonce.
+/// Without this check a stolen credential can be replayed by anyone.
+pub fn verify_key_binding(
+    presentation: &str,
+    holder_jwk: &crate::jwk::Jwk,
+    expected_nonce: &str,
+    expected_audience: &str,
+) -> Result<(), SdJwtError> {
+    let parsed = oid4vc_types::credentials::SdJwtVc::parse(presentation)
+        .map_err(|e| SdJwtError::KeyBinding(e.to_string()))?;
+
+    let kb_jwt = parsed.key_binding_jwt.as_deref().ok_or_else(|| {
+        SdJwtError::KeyBinding("presentation is missing the key binding JWT".to_string())
+    })?;
+
+    let decoded = jws::decode_compact(kb_jwt).map_err(|e| SdJwtError::KeyBinding(e.to_string()))?;
+
+    // The KB-JWT must be signed by the confirmation key, not merely reference it.
+    let expected_alg = crate::keys::algorithm_for_jwk(holder_jwk)
+        .map_err(|e| SdJwtError::KeyBinding(e.to_string()))?;
+    if decoded.header.alg != expected_alg.as_str() {
+        return Err(SdJwtError::KeyBinding(format!(
+            "key binding JWT alg '{}' does not match the confirmation key ({})",
+            decoded.header.alg, expected_alg
+        )));
+    }
+    if decoded.header.typ.as_deref() != Some("kb+jwt") {
+        return Err(SdJwtError::KeyBinding(
+            "key binding JWT must have typ 'kb+jwt'".to_string(),
+        ));
+    }
+
+    crate::keys::verify_with_jwk(
+        holder_jwk,
+        decoded.signing_input.as_bytes(),
+        &decoded.signature,
+    )
+    .map_err(|e| SdJwtError::KeyBinding(format!("key binding signature invalid: {e}")))?;
+
+    let payload: Value = serde_json::from_slice(&decoded.payload)
+        .map_err(|e| SdJwtError::KeyBinding(e.to_string()))?;
+
+    // Replay protection: the nonce must be the one this verifier just issued.
+    match payload.get("nonce").and_then(|v| v.as_str()) {
+        Some(nonce) if nonce == expected_nonce => {}
+        Some(_) => return Err(SdJwtError::KeyBinding("nonce mismatch".to_string())),
+        None => {
+            return Err(SdJwtError::KeyBinding(
+                "key binding JWT is missing 'nonce'".to_string(),
+            ))
+        }
+    }
+
+    // Audience binding: stops a presentation being forwarded to another verifier.
+    match payload.get("aud").and_then(|v| v.as_str()) {
+        Some(aud) if aud == expected_audience => {}
+        Some(_) => return Err(SdJwtError::KeyBinding("audience mismatch".to_string())),
+        None => {
+            return Err(SdJwtError::KeyBinding(
+                "key binding JWT is missing 'aud'".to_string(),
+            ))
+        }
+    }
+
+    // Integrity: ties the KB-JWT to exactly this set of disclosures.
+    let presentation_without_kb = presentation
+        .strip_suffix(kb_jwt)
+        .ok_or_else(|| SdJwtError::KeyBinding("malformed presentation".to_string()))?;
+    let expected_sd_hash = compute_sd_hash(presentation_without_kb);
+
+    match payload.get("sd_hash").and_then(|v| v.as_str()) {
+        Some(sd_hash) if sd_hash == expected_sd_hash => Ok(()),
+        Some(_) => Err(SdJwtError::KeyBinding(
+            "sd_hash does not cover the presented disclosures".to_string(),
+        )),
+        None => Err(SdJwtError::KeyBinding(
+            "key binding JWT is missing 'sd_hash'".to_string(),
+        )),
+    }
 }
 
 /// Create a Key Binding JWT (KB-JWT) for holder binding.
@@ -349,10 +492,149 @@ mod tests {
         assert!(sd_jwt.contains('~'));
 
         // Verify
-        let claims = verify_sd_jwt_vc(&sd_jwt, &issuer_key).unwrap();
-        assert_eq!(claims.get("given_name").unwrap(), "John");
-        assert_eq!(claims.get("family_name").unwrap(), "Doe");
-        assert_eq!(claims.get("degree_type").unwrap(), "Bachelor");
+        let verified = verify_sd_jwt_vc(&sd_jwt, &issuer_key).unwrap();
+        assert_eq!(verified.claims.get("given_name").unwrap(), "John");
+        assert_eq!(verified.claims.get("family_name").unwrap(), "Doe");
+        assert_eq!(verified.claims.get("degree_type").unwrap(), "Bachelor");
+    }
+
+    #[test]
+    fn test_key_binding_roundtrip() {
+        let issuer_key = EcdsaP256KeyPair::generate().unwrap();
+        let holder_key = EcdsaP256KeyPair::generate().unwrap();
+
+        let (sd_jwt, _) = issue_sd_jwt_vc(
+            &issuer_key,
+            "https://issuer.example.com",
+            "https://example.com/credentials/identity",
+            HashMap::new(),
+            HashMap::from([("given_name".to_string(), Value::String("John".into()))]),
+            Some(serde_json::json!({ "jwk": holder_key.public_jwk() })),
+            None,
+        )
+        .unwrap();
+
+        let verified = verify_sd_jwt_vc(&sd_jwt, &issuer_key).unwrap();
+        let cnf = verified.holder_jwk().expect("cnf must round-trip");
+
+        let sd_hash = compute_sd_hash(&sd_jwt);
+        let kb =
+            create_key_binding_jwt(&holder_key, "n-1", "https://verifier.example.com", &sd_hash)
+                .unwrap();
+        let presentation = format!("{sd_jwt}{kb}");
+
+        verify_key_binding(&presentation, &cnf, "n-1", "https://verifier.example.com").unwrap();
+    }
+
+    #[test]
+    fn test_key_binding_rejects_wrong_nonce_and_audience() {
+        let issuer_key = EcdsaP256KeyPair::generate().unwrap();
+        let holder_key = EcdsaP256KeyPair::generate().unwrap();
+
+        let (sd_jwt, _) = issue_sd_jwt_vc(
+            &issuer_key,
+            "https://issuer.example.com",
+            "https://example.com/credentials/identity",
+            HashMap::new(),
+            HashMap::from([("given_name".to_string(), Value::String("John".into()))]),
+            Some(serde_json::json!({ "jwk": holder_key.public_jwk() })),
+            None,
+        )
+        .unwrap();
+
+        let cnf = holder_key.public_jwk();
+        let sd_hash = compute_sd_hash(&sd_jwt);
+        let kb =
+            create_key_binding_jwt(&holder_key, "n-1", "https://verifier.example.com", &sd_hash)
+                .unwrap();
+        let presentation = format!("{sd_jwt}{kb}");
+
+        assert!(verify_key_binding(
+            &presentation,
+            &cnf,
+            "other-nonce",
+            "https://verifier.example.com"
+        )
+        .is_err());
+        assert!(
+            verify_key_binding(&presentation, &cnf, "n-1", "https://elsewhere.example.com")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_key_binding_rejects_a_key_the_credential_does_not_name() {
+        let issuer_key = EcdsaP256KeyPair::generate().unwrap();
+        let holder_key = EcdsaP256KeyPair::generate().unwrap();
+        let attacker_key = EcdsaP256KeyPair::generate().unwrap();
+
+        let (sd_jwt, _) = issue_sd_jwt_vc(
+            &issuer_key,
+            "https://issuer.example.com",
+            "https://example.com/credentials/identity",
+            HashMap::new(),
+            HashMap::from([("given_name".to_string(), Value::String("John".into()))]),
+            Some(serde_json::json!({ "jwk": holder_key.public_jwk() })),
+            None,
+        )
+        .unwrap();
+
+        // Someone who stole the credential signs a KB-JWT with their own key.
+        let sd_hash = compute_sd_hash(&sd_jwt);
+        let kb = create_key_binding_jwt(
+            &attacker_key,
+            "n-1",
+            "https://verifier.example.com",
+            &sd_hash,
+        )
+        .unwrap();
+        let presentation = format!("{sd_jwt}{kb}");
+
+        // Verified against the cnf key from the credential, it must fail.
+        assert!(verify_key_binding(
+            &presentation,
+            &holder_key.public_jwk(),
+            "n-1",
+            "https://verifier.example.com"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_key_binding_rejects_tampered_disclosures() {
+        let issuer_key = EcdsaP256KeyPair::generate().unwrap();
+        let holder_key = EcdsaP256KeyPair::generate().unwrap();
+
+        let (sd_jwt, disclosures) = issue_sd_jwt_vc(
+            &issuer_key,
+            "https://issuer.example.com",
+            "https://example.com/credentials/identity",
+            HashMap::new(),
+            HashMap::from([
+                ("given_name".to_string(), Value::String("John".into())),
+                ("family_name".to_string(), Value::String("Doe".into())),
+            ]),
+            Some(serde_json::json!({ "jwk": holder_key.public_jwk() })),
+            None,
+        )
+        .unwrap();
+
+        // Holder signs over the full credential, then strips a disclosure.
+        let sd_hash = compute_sd_hash(&sd_jwt);
+        let kb =
+            create_key_binding_jwt(&holder_key, "n-1", "https://verifier.example.com", &sd_hash)
+                .unwrap();
+
+        let issuer_jwt = sd_jwt.split('~').next().unwrap();
+        let narrowed = format!("{}~{}~{}", issuer_jwt, disclosures[0].encoded, kb);
+
+        assert!(verify_key_binding(
+            &narrowed,
+            &holder_key.public_jwk(),
+            "n-1",
+            "https://verifier.example.com"
+        )
+        .is_err());
     }
 
     #[test]

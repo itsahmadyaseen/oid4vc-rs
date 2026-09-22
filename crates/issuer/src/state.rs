@@ -58,8 +58,10 @@ pub trait IssuerState: Send + Sync {
 
     // -- Access tokens --
 
-    fn store_access_token(&self, token: &str) -> Result<(), StateError>;
+    /// Store an access token that expires after `expires_in` seconds.
+    fn store_access_token(&self, token: &str, expires_in: u64) -> Result<(), StateError>;
 
+    /// Returns `true` only if the token is known and has not expired.
     fn validate_access_token(&self, token: &str) -> Result<bool, StateError>;
 
     // -- c_nonce management --
@@ -84,12 +86,16 @@ struct NonceEntry {
     expires_in: u64,
 }
 
+struct TokenEntry {
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// In-memory issuer state for development and testing.
 pub struct InMemoryIssuerState {
     sessions: Mutex<HashMap<String, AuthorizationSession>>,
     code_to_uri: Mutex<HashMap<String, String>>,
     pre_auth_codes: Mutex<HashMap<String, PreAuthEntry>>,
-    access_tokens: Mutex<HashMap<String, ()>>,
+    access_tokens: Mutex<HashMap<String, TokenEntry>>,
     c_nonces: Mutex<HashMap<String, NonceEntry>>,
 }
 
@@ -219,21 +225,34 @@ impl IssuerState for InMemoryIssuerState {
         }
     }
 
-    fn store_access_token(&self, token: &str) -> Result<(), StateError> {
+    fn store_access_token(&self, token: &str, expires_in: u64) -> Result<(), StateError> {
         let mut tokens = self
             .access_tokens
             .lock()
             .map_err(|_| StateError::LockPoisoned)?;
-        tokens.insert(token.to_string(), ());
+        tokens.insert(
+            token.to_string(),
+            TokenEntry {
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64),
+            },
+        );
         Ok(())
     }
 
     fn validate_access_token(&self, token: &str) -> Result<bool, StateError> {
-        let tokens = self
+        let mut tokens = self
             .access_tokens
             .lock()
             .map_err(|_| StateError::LockPoisoned)?;
-        Ok(tokens.contains_key(token))
+        match tokens.get(token) {
+            Some(entry) if chrono::Utc::now() < entry.expires_at => Ok(true),
+            Some(_) => {
+                // Expired: drop it so the map does not grow without bound.
+                tokens.remove(token);
+                Ok(false)
+            }
+            None => Ok(false),
+        }
     }
 
     fn store_c_nonce(&self, nonce: &str, expires_in: u64) -> Result<(), StateError> {
@@ -271,9 +290,17 @@ mod tests {
     fn test_in_memory_access_tokens() {
         let state = InMemoryIssuerState::new();
 
-        state.store_access_token("token-1").unwrap();
+        state.store_access_token("token-1", 3600).unwrap();
         assert!(state.validate_access_token("token-1").unwrap());
         assert!(!state.validate_access_token("token-2").unwrap());
+    }
+
+    #[test]
+    fn test_expired_access_token_is_rejected() {
+        let state = InMemoryIssuerState::new();
+
+        state.store_access_token("token-1", 0).unwrap();
+        assert!(!state.validate_access_token("token-1").unwrap());
     }
 
     #[test]

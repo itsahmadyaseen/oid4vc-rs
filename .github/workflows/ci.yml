@@ -59,3 +59,63 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+
+  smoke:
+    name: Smoke (server actually starts)
+    runs-on: ubuntu-latest
+    needs: [check, fmt, clippy, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin oid4vc-server
+
+      # `cargo check`, clippy and the unit tests all pass on a server that
+      # panics at startup, because axum validates route patterns at runtime.
+      # This job runs the binary the way the README tells a user to.
+      - name: Start the server and exercise the documented endpoints
+        env:
+          ADMIN_API_TOKEN: ci-smoke-token
+        run: |
+          set -euo pipefail
+
+          ./target/release/oid4vc-server > server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true; echo "--- server log ---"; cat server.log' EXIT
+
+          ready=false
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:3000/.well-known/openid-credential-issuer > /dev/null; then
+              ready=true
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "server exited during startup"
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "true" ]; then
+            echo "server never became ready"
+            exit 1
+          fi
+
+          curl -sf http://localhost:3000/.well-known/openid-credential-issuer | jq -e .credential_issuer
+          curl -sf http://localhost:3000/.well-known/oauth-authorization-server | jq -e .token_endpoint
+          curl -sf http://localhost:3000/.well-known/jwks.json | jq -e '.keys | length == 2'
+          curl -sf http://localhost:3000/status/revocation | jq -e .credentialSubject
+          curl -sf http://localhost:3000/status/revocation/token | jq -e .status_list
+
+          CODE=$(curl -sf http://localhost:3000/credential_offer \
+            | jq -r '.credential_offer.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"]["pre-authorized_code"]')
+          curl -sf -X POST http://localhost:3000/token \
+            -H 'content-type: application/x-www-form-urlencoded' \
+            --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:pre-authorized_code' \
+            --data-urlencode "pre-authorized_code=$CODE" | jq -e .access_token
+
+          # The admin surface must not be open to unauthenticated callers.
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3000/admin/status/revoke \
+            -H 'content-type: application/json' -d '{"index":1}')
+          test "$status" = "401"
+
+          echo "smoke test passed"

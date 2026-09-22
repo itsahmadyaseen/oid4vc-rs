@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "oid4vc_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "oid4vc-server"
 path = "src/main.rs"
@@ -31,7 +35,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
-anyhow = "1.0"
+urlencoding = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
-tokio-test = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+oid4vc-status = { workspace = true }
+base64ct = { workspace = true }
+sha2 = { workspace = true }

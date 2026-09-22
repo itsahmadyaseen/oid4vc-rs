@@ -44,6 +44,8 @@ pub struct AuthorizationSession {
     pub credential_configuration_ids: Vec<String>,
     /// The issuer state from the offer (if any).
     pub issuer_state: Option<String>,
+    /// The client's `state` parameter, echoed back on the redirect.
+    pub client_state: Option<String>,
     /// When this session was created.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Whether the authorization code has been consumed.
@@ -93,6 +95,7 @@ pub fn process_par(
         redirect_uri: request.redirect_uri.to_string(),
         credential_configuration_ids: credential_config_ids,
         issuer_state: request.issuer_state.clone(),
+        client_state: request.state.clone(),
         created_at: chrono::Utc::now(),
         consumed: false,
     };

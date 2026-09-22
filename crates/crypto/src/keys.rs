@@ -8,6 +8,7 @@ use p256::ecdsa::{
     signature::{Signer, Verifier},
     Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
 };
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -117,6 +118,28 @@ impl EcdsaP256KeyPair {
             use_: Some("sig".to_string()),
         }
     }
+
+    /// Load a P-256 key pair from a PKCS#8 PEM string.
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, KeyError> {
+        let signing_key = P256SigningKey::from_pkcs8_pem(pem)
+            .map_err(|e| KeyError::InvalidKeyMaterial(e.to_string()))?;
+        let verifying_key = P256VerifyingKey::from(&signing_key);
+        let key_id = Self::build_public_jwk(&verifying_key, "").compute_thumbprint();
+
+        Ok(Self {
+            signing_key,
+            verifying_key,
+            key_id,
+        })
+    }
+
+    /// Export the private key as a PKCS#8 PEM string.
+    pub fn to_pkcs8_pem(&self) -> Result<String, KeyError> {
+        self.signing_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .map(|p| p.to_string())
+            .map_err(|e| KeyError::InvalidKeyMaterial(e.to_string()))
+    }
 }
 
 impl KeyPair for EcdsaP256KeyPair {
@@ -176,6 +199,30 @@ impl Ed25519KeyPair {
         })
     }
 
+    /// Load an Ed25519 key pair from a PKCS#8 PEM string.
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, KeyError> {
+        use ed25519_dalek::pkcs8::DecodePrivateKey;
+        let signing_key = ed25519_dalek::SigningKey::from_pkcs8_pem(pem)
+            .map_err(|e| KeyError::InvalidKeyMaterial(e.to_string()))?;
+        let verifying_key = ed25519_dalek::VerifyingKey::from(&signing_key);
+        let key_id = Self::build_public_jwk(&verifying_key, "").compute_thumbprint();
+
+        Ok(Self {
+            signing_key,
+            verifying_key,
+            key_id,
+        })
+    }
+
+    /// Export the private key as a PKCS#8 PEM string.
+    pub fn to_pkcs8_pem(&self) -> Result<String, KeyError> {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        self.signing_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .map(|p| p.to_string())
+            .map_err(|e| KeyError::InvalidKeyMaterial(e.to_string()))
+    }
+
     fn build_public_jwk(key: &ed25519_dalek::VerifyingKey, kid: &str) -> Jwk {
         let x = Base64UrlUnpadded::encode_string(key.as_bytes());
 
@@ -223,6 +270,87 @@ impl KeyPair for Ed25519KeyPair {
 
     fn public_jwk(&self) -> Jwk {
         Self::build_public_jwk(&self.verifying_key, &self.key_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public-key verification from a bare JWK
+// ---------------------------------------------------------------------------
+
+/// Verify a signature using only a public JWK.
+///
+/// Used for wallet-supplied keys that arrive inside a JWS header (OID4VCI
+/// proof-of-possession) or a credential's `cnf` claim (SD-JWT VC key binding),
+/// where there is no local key pair to verify against.
+pub fn verify_with_jwk(jwk: &Jwk, message: &[u8], signature: &[u8]) -> Result<(), KeyError> {
+    match (jwk.kty.as_str(), jwk.crv.as_deref()) {
+        ("EC", Some("P-256")) => {
+            let x = decode_coordinate(jwk.x.as_deref(), "x")?;
+            let y = decode_coordinate(jwk.y.as_deref(), "y")?;
+
+            if x.len() != 32 || y.len() != 32 {
+                return Err(KeyError::InvalidKeyMaterial(
+                    "P-256 coordinates must be 32 bytes".to_string(),
+                ));
+            }
+
+            let point = p256::EncodedPoint::from_affine_coordinates(
+                x.as_slice().into(),
+                y.as_slice().into(),
+                false,
+            );
+            let verifying_key = P256VerifyingKey::from_encoded_point(&point)
+                .map_err(|e| KeyError::InvalidKeyMaterial(e.to_string()))?;
+            let sig = P256Signature::from_slice(signature)
+                .map_err(|e| KeyError::VerificationFailed(e.to_string()))?;
+
+            verifying_key
+                .verify(message, &sig)
+                .map_err(|e| KeyError::VerificationFailed(e.to_string()))
+        }
+        ("OKP", Some("Ed25519")) => {
+            use ed25519_dalek::Verifier;
+
+            let x = decode_coordinate(jwk.x.as_deref(), "x")?;
+            let x_bytes: [u8; 32] = x.as_slice().try_into().map_err(|_| {
+                KeyError::InvalidKeyMaterial("Ed25519 public key must be 32 bytes".to_string())
+            })?;
+            let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&x_bytes)
+                .map_err(|e| KeyError::InvalidKeyMaterial(e.to_string()))?;
+
+            let sig_bytes: [u8; 64] = signature.try_into().map_err(|_| {
+                KeyError::VerificationFailed("invalid signature length".to_string())
+            })?;
+            let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+            verifying_key
+                .verify(message, &sig)
+                .map_err(|e| KeyError::VerificationFailed(e.to_string()))
+        }
+        (kty, crv) => Err(KeyError::InvalidKeyMaterial(format!(
+            "unsupported JWK key type: kty={kty}, crv={}",
+            crv.unwrap_or("none")
+        ))),
+    }
+}
+
+/// Decode a base64url-encoded JWK coordinate.
+fn decode_coordinate(value: Option<&str>, name: &str) -> Result<Vec<u8>, KeyError> {
+    let encoded =
+        value.ok_or_else(|| KeyError::InvalidKeyMaterial(format!("JWK is missing '{name}'")))?;
+    Base64UrlUnpadded::decode_vec(encoded)
+        .map_err(|e| KeyError::InvalidKeyMaterial(format!("invalid '{name}': {e}")))
+}
+
+/// The JWS `alg` a JWK expects, derived from its key type.
+pub fn algorithm_for_jwk(jwk: &Jwk) -> Result<Algorithm, KeyError> {
+    match (jwk.kty.as_str(), jwk.crv.as_deref()) {
+        ("EC", Some("P-256")) => Ok(Algorithm::ES256),
+        ("OKP", Some("Ed25519")) => Ok(Algorithm::EdDSA),
+        (kty, crv) => Err(KeyError::InvalidKeyMaterial(format!(
+            "unsupported JWK key type: kty={kty}, crv={}",
+            crv.unwrap_or("none")
+        ))),
     }
 }
 
@@ -331,6 +459,46 @@ mod tests {
         assert_eq!(jwk.crv.as_deref(), Some("Ed25519"));
         assert!(jwk.x.is_some());
         assert!(jwk.d.is_none());
+    }
+
+    #[test]
+    fn test_verify_with_jwk_p256() {
+        let kp = EcdsaP256KeyPair::generate().unwrap();
+        let other = EcdsaP256KeyPair::generate().unwrap();
+        let msg = b"bound to this message";
+        let sig = kp.sign(msg).unwrap();
+
+        verify_with_jwk(&kp.public_jwk(), msg, &sig).unwrap();
+        assert!(verify_with_jwk(&other.public_jwk(), msg, &sig).is_err());
+        assert!(verify_with_jwk(&kp.public_jwk(), b"other message", &sig).is_err());
+    }
+
+    #[test]
+    fn test_verify_with_jwk_ed25519() {
+        let kp = Ed25519KeyPair::generate().unwrap();
+        let other = Ed25519KeyPair::generate().unwrap();
+        let msg = b"bound to this message";
+        let sig = kp.sign(msg).unwrap();
+
+        verify_with_jwk(&kp.public_jwk(), msg, &sig).unwrap();
+        assert!(verify_with_jwk(&other.public_jwk(), msg, &sig).is_err());
+    }
+
+    #[test]
+    fn test_pem_roundtrip_preserves_key_id() {
+        let kp = EcdsaP256KeyPair::generate().unwrap();
+        let pem = kp.to_pkcs8_pem().unwrap();
+        let loaded = EcdsaP256KeyPair::from_pkcs8_pem(&pem).unwrap();
+
+        assert_eq!(kp.key_id(), loaded.key_id());
+        // A signature from the reloaded key verifies under the original.
+        let sig = loaded.sign(b"msg").unwrap();
+        kp.verify(b"msg", &sig).unwrap();
+
+        let ed = Ed25519KeyPair::generate().unwrap();
+        let ed_pem = ed.to_pkcs8_pem().unwrap();
+        let ed_loaded = Ed25519KeyPair::from_pkcs8_pem(&ed_pem).unwrap();
+        assert_eq!(ed.key_id(), ed_loaded.key_id());
     }
 
     #[test]

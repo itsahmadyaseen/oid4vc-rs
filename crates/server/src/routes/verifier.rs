@@ -14,6 +14,7 @@ use oid4vc_verifier::request::{self, RequestParams};
 use oid4vc_verifier::response;
 use oid4vc_verifier::session::VerifierState;
 
+use crate::extract::FormOrJson;
 use crate::middleware::json_error;
 use crate::state::AppState;
 
@@ -21,34 +22,46 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/verifier/authorize", post(create_authorization))
-        .route("/verifier/request/:id", get(get_request))
+        .route("/verifier/request/{id}", get(get_request))
         .route("/verifier/response", post(receive_response))
 }
 
 /// `POST /verifier/authorize` — Create an OID4VP authorization request.
 ///
 /// The verifier calls this to start a presentation flow. Returns the
-/// authorization request that should be sent to the wallet.
+/// authorization request, the `request_uri` the wallet fetches it from,
+/// and the deep link that carries both.
 async fn create_authorization(State(state): State<Arc<AppState>>) -> Response {
     let query = DcqlQueryBuilder::new()
         .add_sd_jwt_vc_query(
             "identity_credential",
-            &format!("{}/credentials/identity", state.external_url),
+            &format!("{}/credentials/identity", state.issuer_id),
             vec![("given_name", true), ("family_name", true)],
         )
         .build();
 
     let params = RequestParams {
-        client_id: state.external_url.to_string(),
-        response_uri: state.external_url.join("/verifier/response").unwrap(),
+        client_id: state.issuer_id.clone(),
+        response_uri: state.url_for("/verifier/response"),
         dcql_query: Some(query),
         session_expiry_secs: 600,
     };
 
     match request::create_authorization_request(&params, state.verifier_state.as_ref()) {
         Ok((auth_request, session_id)) => {
+            // The wallet is handed a request_uri, not the raw request — this is
+            // what makes GET /verifier/request/{id} reachable in the flow.
+            let request_uri = state.url_for(&format!("/verifier/request/{session_id}"));
+            let wallet_uri = format!(
+                "openid4vp://?client_id={}&request_uri={}",
+                urlencoding::encode(&state.issuer_id),
+                urlencoding::encode(request_uri.as_str())
+            );
+
             let response_body = serde_json::json!({
                 "session_id": session_id,
+                "request_uri": request_uri,
+                "wallet_uri": wallet_uri,
                 "authorization_request": auth_request,
             });
             Json(response_body).into_response()
@@ -61,7 +74,7 @@ async fn create_authorization(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-/// `GET /verifier/request/:id` — Serve the authorization request as JWT.
+/// `GET /verifier/request/{id}` — Serve the authorization request as JWT.
 ///
 /// The wallet retrieves this JWT via the `request_uri` parameter.
 async fn get_request(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -89,10 +102,11 @@ async fn get_request(State(state): State<Arc<AppState>>, Path(id): Path<String>)
 
 /// `POST /verifier/response` — Receive the VP token from the wallet.
 ///
-/// The wallet sends its verifiable presentation here via `direct_post`.
+/// The wallet sends its verifiable presentation here via `direct_post`,
+/// which is form-encoded.
 async fn receive_response(
     State(state): State<Arc<AppState>>,
-    Json(auth_response): Json<AuthorizationResponse>,
+    FormOrJson(auth_response): FormOrJson<AuthorizationResponse>,
 ) -> Response {
     match response::process_response(
         &auth_response,
@@ -100,24 +114,36 @@ async fn receive_response(
         state.verifier_state.as_ref(),
     ) {
         Ok(result) => {
+            // Reaching here means every check passed: issuer signature, validity
+            // window, holder key binding, nonce, audience, and the DCQL query.
             let body = serde_json::json!({
                 "session_id": result.session_id,
-                "valid": result.valid,
+                "valid": true,
                 "disclosed_claims": result.disclosed_claims,
             });
             Json(body).into_response()
         }
         Err(e) => {
-            let status = match &e {
+            let (status, code) = match &e {
                 response::ResponseError::InvalidState | response::ResponseError::SessionExpired => {
-                    StatusCode::BAD_REQUEST
+                    (StatusCode::BAD_REQUEST, "invalid_request")
                 }
-                response::ResponseError::MissingVpToken
-                | response::ResponseError::NonceMismatch
-                | response::ResponseError::VerificationFailed(_) => StatusCode::UNAUTHORIZED,
-                response::ResponseError::StateError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                response::ResponseError::MissingVpToken => {
+                    (StatusCode::BAD_REQUEST, "invalid_request")
+                }
+                response::ResponseError::QueryNotSatisfied(_) => {
+                    (StatusCode::BAD_REQUEST, "invalid_presentation")
+                }
+                response::ResponseError::NonceMismatch
+                | response::ResponseError::KeyBindingFailed(_)
+                | response::ResponseError::VerificationFailed(_) => {
+                    (StatusCode::UNAUTHORIZED, "invalid_presentation")
+                }
+                response::ResponseError::StateError(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+                }
             };
-            json_error(status, "invalid_presentation", &e.to_string())
+            json_error(status, code, &e.to_string())
         }
     }
 }

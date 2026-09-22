@@ -204,6 +204,20 @@ mod option_serde_bytes_base64 {
 }
 
 // ---------------------------------------------------------------------------
+// JWT-VC
+// ---------------------------------------------------------------------------
+
+/// A JWT-VC (JSON Web Token Verifiable Credential).
+///
+/// The credential is a standard JSON Web Token containing the VC data model
+/// claims in its payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwtVc {
+    /// The JWT string representation of the credential.
+    pub jwt: String,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

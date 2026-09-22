@@ -16,14 +16,8 @@ p256 = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
-hmac = { workspace = true }
-jsonwebtoken = { workspace = true }
 base64ct = { workspace = true }
 ciborium = { workspace = true }
-coset = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
 
-[dev-dependencies]
-tokio-test = { workspace = true }

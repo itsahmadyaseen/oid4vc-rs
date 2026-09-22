@@ -34,15 +34,12 @@ p256 = { version = "0.13", features = ["ecdsa", "jwk", "pem"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pem"] }
 sha2 = "0.10"
 rand = "0.8"
-hmac = "0.12"
 
 # JOSE
-jsonwebtoken = "9"
 base64ct = { version = "1", features = ["alloc"] }
 
-# CBOR / COSE (for mdoc)
+# CBOR (for mdoc)
 ciborium = "0.2"
-coset = "0.3"
 
 # Status list compression
 flate2 = "1"
@@ -65,9 +62,6 @@ dotenvy = "0.15"
 
 # URL encoding
 urlencoding = "2"
-
-# Testing
-tokio-test = "0.4"
 
 # Internal crates
 oid4vc-types = { path = "crates/types" }

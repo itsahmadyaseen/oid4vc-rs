@@ -23,5 +23,3 @@ rand = { workspace = true }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
 
-[dev-dependencies]
-tokio-test = { workspace = true }
