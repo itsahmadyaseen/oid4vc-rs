@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+keys/
+*.pem
+.env
+.env.*
+!.env.example
+profile/
+job-hunt/

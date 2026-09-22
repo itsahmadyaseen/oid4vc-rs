@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.pdb
 
+# Signing keys — never commit private key material
+/keys/
+*.pem
+
 # Environment
 .env
 .env.local
@@ -30,3 +34,7 @@ tarpaulin-report.html
 # Private job-hunt notes — never publish
 github-proof-plan.md
 job-hunt/
+
+# Local smoke-test output
+server.log
+server.pid
