@@ -6,9 +6,11 @@
 //! - **JWK** — JSON Web Key and JWKS
 //! - **SD-JWT** — Selective Disclosure JWT issuance and verification
 //! - **COSE** — CBOR Object Signing (COSE_Sign1) for mdoc
+//! - **X.509** — the certificate chain carried in `x5c`
 
 pub mod cose;
 pub mod jwk;
 pub mod jws;
 pub mod keys;
 pub mod sd_jwt;
+pub mod x509;

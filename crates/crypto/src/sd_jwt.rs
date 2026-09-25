@@ -153,6 +153,8 @@ pub struct SdJwtVcClaims {
     pub plain_claims: HashMap<String, Value>,
 }
 
+const DAY_SECS: i64 = 86_400;
+
 /// Issue an SD-JWT VC.
 ///
 /// Takes the issuer key, base claims, and a set of claims that should be
@@ -166,6 +168,33 @@ pub fn issue_sd_jwt_vc(
     holder_jwk: Option<Value>,
     status: Option<Value>,
 ) -> Result<(String, Vec<Disclosure>), SdJwtError> {
+    issue_sd_jwt_vc_with_x5c(
+        issuer_key,
+        issuer_url,
+        vct,
+        plain_claims,
+        disclosable_claims,
+        holder_jwk,
+        status,
+        None,
+    )
+}
+
+/// Issue an SD-JWT VC whose header carries the issuer's certificate chain.
+///
+/// HAIP requires `x5c` so a verifier can chain the signing key to a trust
+/// anchor instead of having to know this issuer's key in advance.
+#[allow(clippy::too_many_arguments)]
+pub fn issue_sd_jwt_vc_with_x5c(
+    issuer_key: &dyn KeyPair,
+    issuer_url: &str,
+    vct: &str,
+    plain_claims: HashMap<String, Value>,
+    disclosable_claims: HashMap<String, Value>,
+    holder_jwk: Option<Value>,
+    status: Option<Value>,
+    x5c: Option<Vec<String>>,
+) -> Result<(String, Vec<Disclosure>), SdJwtError> {
     // Create disclosures
     let mut disclosures: Vec<Disclosure> = Vec::new();
     let mut sd_hashes: Vec<String> = Vec::new();
@@ -176,14 +205,17 @@ pub fn issue_sd_jwt_vc(
         disclosures.push(disclosure);
     }
 
-    // Build the payload
+    // Build the payload. Time claims are rounded down to the day: a precise
+    // issuance time is shared by every credential in a batch, which lets
+    // verifiers correlate them (RFC 9901 §10.1).
     let now = chrono::Utc::now().timestamp();
+    let issued = now - now.rem_euclid(DAY_SECS);
     let claims = SdJwtVcClaims {
         iss: issuer_url.to_string(),
         sub: None,
-        iat: now,
-        exp: Some(now + 86400 * 365), // 1 year default
-        nbf: Some(now),
+        iat: issued,
+        exp: Some(issued + DAY_SECS * 365), // 1 year default
+        nbf: Some(issued),
         vct: vct.to_string(),
         sd: sd_hashes,
         sd_alg: Some("sha-256".to_string()),
@@ -193,7 +225,8 @@ pub fn issue_sd_jwt_vc(
     };
 
     // Sign the issuer JWT
-    let header = jws::build_header(issuer_key, Some("vc+sd-jwt"));
+    let mut header = jws::build_header(issuer_key, Some("dc+sd-jwt"));
+    header.x5c = x5c;
     let issuer_jwt = jws::sign_compact(issuer_key, &header, &claims)
         .map_err(|e| SdJwtError::Signing(e.to_string()))?;
 

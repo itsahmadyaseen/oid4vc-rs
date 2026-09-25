@@ -38,6 +38,9 @@ rand = "0.8"
 # JOSE
 base64ct = { version = "1", features = ["alloc"] }
 
+# X.509 certificates for the x5c chain HAIP requires
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+
 # CBOR (for mdoc)
 ciborium = "0.2"
 

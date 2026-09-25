@@ -43,6 +43,10 @@ pub struct JwsHeader {
     /// JWK embedded in the header (used in proof-of-possession).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jwk: Option<crate::jwk::Jwk>,
+
+    /// X.509 certificate chain, leaf first (RFC 7515 §4.1.6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x5c: Option<Vec<String>>,
 }
 
 /// Sign a payload and produce a JWS compact serialization.
@@ -124,6 +128,25 @@ pub fn verify_compact(jws: &str, key: &dyn KeyPair) -> Result<DecodedJws, JwsErr
     Ok(decoded)
 }
 
+/// Verify a JWS against a public JWK, checking `alg` matches the key type.
+///
+/// Pinning `alg` to the key stops a caller from choosing the verification
+/// algorithm, and rejects `none` because no key type maps to it.
+pub fn verify_with_public_jwk(jws: &str, jwk: &crate::jwk::Jwk) -> Result<DecodedJws, JwsError> {
+    let decoded = decode_compact(jws)?;
+    let expected =
+        crate::keys::algorithm_for_jwk(jwk).map_err(|e| JwsError::Verification(e.to_string()))?;
+    if decoded.header.alg != expected.as_str() {
+        return Err(JwsError::Verification(format!(
+            "alg '{}' does not match the key ({expected})",
+            decoded.header.alg
+        )));
+    }
+    crate::keys::verify_with_jwk(jwk, decoded.signing_input.as_bytes(), &decoded.signature)
+        .map_err(|e| JwsError::Verification(e.to_string()))?;
+    Ok(decoded)
+}
+
 /// Build a standard JWS header for a given key.
 pub fn build_header(key: &dyn KeyPair, typ: Option<&str>) -> JwsHeader {
     JwsHeader {
@@ -131,6 +154,7 @@ pub fn build_header(key: &dyn KeyPair, typ: Option<&str>) -> JwsHeader {
         typ: typ.map(|t| t.to_string()),
         kid: Some(key.key_id().to_string()),
         jwk: None,
+        x5c: None,
     }
 }
 
@@ -141,6 +165,7 @@ pub fn build_header_with_jwk(key: &dyn KeyPair, typ: Option<&str>) -> JwsHeader 
         typ: typ.map(|t| t.to_string()),
         kid: None, // When jwk is present, kid MUST NOT be present
         jwk: Some(key.public_jwk()),
+        x5c: None,
     }
 }
 

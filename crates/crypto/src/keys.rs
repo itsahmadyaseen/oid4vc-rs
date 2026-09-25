@@ -133,6 +133,14 @@ impl EcdsaP256KeyPair {
         })
     }
 
+    /// The public key as an uncompressed SEC1 point (`04 || x || y`).
+    pub fn public_key_sec1(&self) -> Vec<u8> {
+        self.verifying_key
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec()
+    }
+
     /// Export the private key as a PKCS#8 PEM string.
     pub fn to_pkcs8_pem(&self) -> Result<String, KeyError> {
         self.signing_key
