@@ -210,7 +210,11 @@ pub struct IssueRequest<'a> {
     pub namespaces: BTreeMap<String, Vec<(String, Value)>>,
     /// The holder's key: only its owner can later present the mdoc.
     pub device_key: &'a Jwk,
-    /// Start of the MSO validity period; never before the signing time.
+    /// When the MSO counts as signed. Round it (to the day, say): a precise
+    /// signing time is shared by every mdoc in a batch and lets verifiers
+    /// correlate them (RFC 9901 §10.1).
+    pub signed: DateTime<Utc>,
+    /// Start of the MSO validity period; never before `signed`.
     pub valid_from: DateTime<Utc>,
     /// End of the MSO validity period.
     pub valid_until: DateTime<Utc>,
@@ -228,7 +232,7 @@ pub fn issue(request: &IssueRequest<'_>, signer: &dyn KeyPair) -> Result<Vec<u8>
     let whole_seconds = |at: DateTime<Utc>| {
         DateTime::from_timestamp(at.timestamp(), 0).expect("timestamp in range")
     };
-    let signed = whole_seconds(Utc::now());
+    let signed = whole_seconds(request.signed);
     let valid_from = whole_seconds(request.valid_from).max(signed);
     let valid_until = whole_seconds(request.valid_until);
     if valid_until <= valid_from {
@@ -895,6 +899,7 @@ mod tests {
                     doc_type: MDL_DOCTYPE,
                     namespaces,
                     device_key: &self.holder_key.public_jwk(),
+                    signed: Utc::now(),
                     valid_from: Utc::now(),
                     valid_until: Utc::now() + chrono::Duration::days(30),
                     status: Some(StatusListRef {

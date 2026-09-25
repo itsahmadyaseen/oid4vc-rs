@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use base64ct::{Base64UrlUnpadded, Encoding};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -30,6 +30,11 @@ const DEMO_BIRTH_DATE: &str = "1990-01-01";
 
 /// Who the demo mDL names as its issuing authority.
 const ISSUING_AUTHORITY: &str = "oid4vc-rs Development Issuing Authority";
+
+/// The demo subject's licence number. It is a property of the licence, so
+/// every copy carries it: credentials issued in one batch must share one
+/// dataset (OID4VCI 1.0 §3.3.2).
+const DEMO_DOCUMENT_NUMBER: &str = "D1234567";
 
 /// A neutral placeholder photo for the mDL's mandatory `portrait` (JPEG).
 const PORTRAIT_JPEG: &[u8] = include_bytes!("../assets/portrait.jpg");
@@ -415,17 +420,22 @@ fn issue_mdoc_credential(
         )
     })?;
 
-    let now = chrono::Utc::now();
+    // Time information is rounded down to the day: a precise signing time is
+    // shared by every mDL in a batch, which lets verifiers correlate them
+    // (RFC 9901 §10.1). validUntil is derived from it, so it is rounded too.
+    let today = start_of_day(Utc::now());
     let request = mdoc::IssueRequest {
         doc_type,
         namespaces: BTreeMap::from([(
             mdoc::MDL_NAMESPACE.to_string(),
-            mdl_elements(&country, now.date_naive()),
+            mdl_elements(&country, today.date_naive()),
         )]),
         device_key: holder_jwk,
-        valid_from: now,
-        valid_until: (now + chrono::Duration::days(MSO_VALIDITY_DAYS))
-            .min(signer.certificate.not_after()),
+        signed: today,
+        valid_from: today,
+        valid_until: start_of_day(
+            (today + chrono::Duration::days(MSO_VALIDITY_DAYS)).min(signer.certificate.not_after()),
+        ),
         status: (signer.allocate_status)().map_err(CredentialError::IssuanceError)?,
         x5chain: vec![signer.certificate.der().to_vec()],
     };
@@ -435,6 +445,11 @@ fn issue_mdoc_credential(
     Ok(Value::String(Base64UrlUnpadded::encode_string(
         &issuer_signed,
     )))
+}
+
+/// Midnight UTC at the start of `at`'s day.
+fn start_of_day(at: DateTime<Utc>) -> DateTime<Utc> {
+    at.date_naive().and_time(NaiveTime::MIN).and_utc()
 }
 
 /// The demo subject's mDL data elements, in the order
@@ -458,10 +473,7 @@ fn mdl_elements(issuing_country: &str, today: NaiveDate) -> Vec<(String, Cbor)> 
         // Table B.3: must equal the document signer's countryName.
         ("issuing_country", text(issuing_country)),
         ("issuing_authority", text(ISSUING_AUTHORITY)),
-        (
-            "document_number",
-            text(&format!("{:09}", rand::random::<u32>() % 1_000_000_000)),
-        ),
+        ("document_number", text(DEMO_DOCUMENT_NUMBER)),
         ("portrait", Cbor::Bytes(PORTRAIT_JPEG.to_vec())),
         (
             "driving_privileges",
@@ -823,6 +835,15 @@ mod tests {
         issuer_key: &EcdsaP256KeyPair,
         holder_key: &EcdsaP256KeyPair,
     ) -> (Vec<u8>, oid4vc_crypto::x509::IssuerPki) {
+        let (mut issued, pki) = issue_mdls(issuer_key, &[holder_key]);
+        (issued.remove(0), pki)
+    }
+
+    /// Issue one mDL per holder in a single batch request.
+    fn issue_mdls(
+        issuer_key: &EcdsaP256KeyPair,
+        holder_keys: &[&EcdsaP256KeyPair],
+    ) -> (Vec<Vec<u8>>, oid4vc_crypto::x509::IssuerPki) {
         let (state, metadata) = (state_granting(MDL), metadata());
         let pki = oid4vc_crypto::x509::IssuerPki::mint_development(
             &oid4vc_crypto::x509::DevelopmentPkiParams {
@@ -832,9 +853,12 @@ mod tests {
             },
         )
         .unwrap();
+        // Hands out 42, 43, ...
+        let next = std::cell::Cell::new(42);
         let allocate = || {
+            let idx = next.replace(next.get() + 1);
             Ok(Some(StatusListRef {
-                idx: 42,
+                idx,
                 uri: "https://issuer.example.com/status/mdoc".to_string(),
             }))
         };
@@ -846,13 +870,22 @@ mod tests {
             ..ctx(issuer_key, &metadata)
         };
 
-        let mut request = request_with_proofs(&[&wallet_proof(holder_key, "nonce-abc", ISSUER)]);
+        let proofs: Vec<String> = holder_keys
+            .iter()
+            .map(|holder| wallet_proof(*holder, "nonce-abc", ISSUER))
+            .collect();
+        let mut request =
+            request_with_proofs(&proofs.iter().map(String::as_str).collect::<Vec<_>>());
         request.credential_configuration_id = Some(MDL.to_string());
         let response = process_credential_request(&request, "token-123", &ctx, &state).unwrap();
 
-        let issuer_signed =
-            Base64UrlUnpadded::decode_vec(&first_credential(response)).expect("base64url");
-        (issuer_signed, pki)
+        let issued = response
+            .credentials
+            .unwrap()
+            .iter()
+            .map(|c| Base64UrlUnpadded::decode_vec(c.credential.as_str().unwrap()).unwrap())
+            .collect();
+        (issued, pki)
     }
 
     #[test]
@@ -903,6 +936,42 @@ mod tests {
         assert_eq!(claim("age_over_18"), true);
         assert_eq!(claim("age_over_21"), true);
         assert_eq!(claim("driving_privileges")[0]["vehicle_category_code"], "B");
+    }
+
+    /// OID4VCI 1.0 §3.3.2: one dataset per batch, different cryptographic
+    /// data. RFC 9901 §10.1: no precise time to correlate the copies by.
+    #[test]
+    fn test_batch_mdls_share_a_dataset_but_not_a_precise_time() {
+        let issuer_key = EcdsaP256KeyPair::generate().unwrap();
+        let (a, b) = (
+            EcdsaP256KeyPair::generate().unwrap(),
+            EcdsaP256KeyPair::generate().unwrap(),
+        );
+        let (issued, pki) = issue_mdls(&issuer_key, &[&a, &b]);
+        let mdls: Vec<_> = issued
+            .iter()
+            .map(|bytes| {
+                mdoc::verify_issuer_signed(
+                    bytes,
+                    std::slice::from_ref(&pki.trust_anchor),
+                    Utc::now(),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        assert_eq!(mdls[0].claims, mdls[1].claims);
+        assert_ne!(mdls[0].device_key.x, mdls[1].device_key.x);
+        assert_ne!(mdls[0].status, mdls[1].status);
+        for mdl in &mdls {
+            for (name, at) in [
+                ("signed", mdl.signed),
+                ("validFrom", mdl.valid_from),
+                ("validUntil", mdl.valid_until),
+            ] {
+                assert_eq!(at, start_of_day(at), "{name} is not rounded to the day");
+            }
+        }
     }
 
     #[test]
