@@ -6,8 +6,8 @@
 use std::io::{Read, Write};
 
 use base64ct::{Base64UrlUnpadded, Encoding};
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use thiserror::Error;
 
@@ -74,7 +74,9 @@ impl TokenStatusListImpl {
         let bit_offset = ((index % entries_per_byte) * self.bits_per_status as u64) as u8;
         let mask = ((1u16 << self.bits_per_status) - 1) as u8;
 
-        Ok((self.data[byte_index] >> (8 - self.bits_per_status - bit_offset)) & mask)
+        // Index 0 occupies the least significant bits of byte 0
+        // (draft-ietf-oauth-status-list §4.1).
+        Ok((self.data[byte_index] >> bit_offset) & mask)
     }
 
     /// Set the status value at the given index.
@@ -93,10 +95,9 @@ impl TokenStatusListImpl {
         let bit_offset = ((index % entries_per_byte) * self.bits_per_status as u64) as u8;
         let mask = ((1u16 << self.bits_per_status) - 1) as u8;
 
-        // Clear the existing bits
-        self.data[byte_index] &= !(mask << (8 - self.bits_per_status - bit_offset));
-        // Set the new bits
-        self.data[byte_index] |= value << (8 - self.bits_per_status - bit_offset);
+        // Clear the existing bits, then set the new ones (least significant first).
+        self.data[byte_index] &= !(mask << bit_offset);
+        self.data[byte_index] |= value << bit_offset;
 
         Ok(())
     }
@@ -117,8 +118,10 @@ impl TokenStatusListImpl {
     }
 
     /// Encode as a compressed, base64url-encoded string (the `lst` field).
+    ///
+    /// The spec requires DEFLATE in the ZLIB format (RFC 1950), not gzip.
     pub fn encode(&self) -> Result<String, TokenStatusListError> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
         encoder
             .write_all(&self.data)
             .map_err(|e| TokenStatusListError::Compression(e.to_string()))?;
@@ -141,7 +144,7 @@ impl TokenStatusListImpl {
         let compressed = Base64UrlUnpadded::decode_vec(encoded)
             .map_err(|e| TokenStatusListError::Base64Error(e.to_string()))?;
 
-        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut decoder = ZlibDecoder::new(&compressed[..]);
         let mut data = Vec::new();
         decoder
             .read_to_end(&mut data)
@@ -225,5 +228,34 @@ mod tests {
     fn test_index_out_of_bounds() {
         let list = TokenStatusListImpl::new(100, 2).unwrap();
         assert!(list.get(100).is_err());
+    }
+
+    /// The 1-bit example from draft-ietf-oauth-status-list §4.1.
+    #[test]
+    fn test_decodes_spec_example_one_bit() {
+        let list = TokenStatusListImpl::decode("eNrbuRgAAhcBXQ", 16, 1).unwrap();
+        let statuses: Vec<u8> = (0..16).map(|i| list.get(i).unwrap()).collect();
+        assert_eq!(statuses, [1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1]);
+    }
+
+    /// The 2-bit example from draft-ietf-oauth-status-list §4.1.
+    #[test]
+    fn test_decodes_spec_example_two_bits() {
+        let list = TokenStatusListImpl::decode("eNo76fITAAPfAgc", 12, 2).unwrap();
+        let statuses: Vec<u8> = (0..12).map(|i| list.get(i).unwrap()).collect();
+        assert_eq!(statuses, [1, 2, 0, 3, 0, 1, 0, 1, 1, 2, 3, 3]);
+    }
+
+    #[test]
+    fn test_encodes_the_spec_byte_layout() {
+        let mut list = TokenStatusListImpl::new(16, 1).unwrap();
+        for (i, v) in [1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1]
+            .into_iter()
+            .enumerate()
+        {
+            list.set(i as u64, v).unwrap();
+        }
+        let round_trip = TokenStatusListImpl::decode(&list.encode().unwrap(), 16, 1).unwrap();
+        assert_eq!(round_trip.data, vec![0xB9, 0xA3]);
     }
 }

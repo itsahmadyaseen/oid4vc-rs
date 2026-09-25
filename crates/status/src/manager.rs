@@ -3,7 +3,7 @@
 //! Provides a single interface for managing credential status across both
 //! W3C StatusList2021 and IETF Token Status List formats.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use thiserror::Error;
@@ -34,7 +34,8 @@ struct ManagedList {
     sl2021: StatusList,
     tsl: TokenStatusListImpl,
     purpose: StatusPurpose,
-    next_index: usize,
+    capacity: usize,
+    allocated: HashSet<usize>,
 }
 
 /// Unified status manager for credential lifecycle management.
@@ -58,7 +59,8 @@ impl StatusManager {
                 sl2021: StatusList::new(100_000),
                 tsl: TokenStatusListImpl::new(100_000, 2).unwrap(),
                 purpose: StatusPurpose::Revocation,
-                next_index: 0,
+                capacity: 100_000,
+                allocated: HashSet::new(),
             },
         );
 
@@ -69,7 +71,8 @@ impl StatusManager {
                 sl2021: StatusList::new(100_000),
                 tsl: TokenStatusListImpl::new(100_000, 2).unwrap(),
                 purpose: StatusPurpose::Suspension,
-                next_index: 0,
+                capacity: 100_000,
+                allocated: HashSet::new(),
             },
         );
 
@@ -82,6 +85,10 @@ impl StatusManager {
     /// Allocate a status entry for a new credential.
     ///
     /// Returns a `StatusList2021Entry` that should be embedded in the issued credential.
+    ///
+    /// Indices are drawn at random from the unused ones. Sequential indices
+    /// would let anyone who sees two credentials tell they were issued
+    /// together (HAIP §6.1, Token Status List §12.5.1).
     pub fn allocate_entry(
         &self,
         purpose: StatusPurpose,
@@ -93,8 +100,15 @@ impl StatusManager {
             .get_mut(&list_id)
             .ok_or_else(|| ManagerError::ListNotFound(list_id.clone()))?;
 
-        let index = managed.next_index;
-        managed.next_index += 1;
+        if managed.allocated.len() >= managed.capacity {
+            return Err(ManagerError::NoAvailableIndex);
+        }
+        let index = loop {
+            let candidate = rand::random::<usize>() % managed.capacity;
+            if managed.allocated.insert(candidate) {
+                break candidate;
+            }
+        };
 
         let status_list_url = self
             .issuer_url
@@ -232,11 +246,21 @@ mod tests {
     fn test_allocate_entry() {
         let manager = StatusManager::new(Url::parse("https://issuer.example.com").unwrap());
 
-        let entry1 = manager.allocate_entry(StatusPurpose::Revocation).unwrap();
-        assert_eq!(entry1.status_list_index, "0");
+        let indices: Vec<usize> = (0..50)
+            .map(|_| {
+                let entry = manager.allocate_entry(StatusPurpose::Revocation).unwrap();
+                entry.status_list_index.parse().unwrap()
+            })
+            .collect();
 
-        let entry2 = manager.allocate_entry(StatusPurpose::Revocation).unwrap();
-        assert_eq!(entry2.status_list_index, "1");
+        // Unique...
+        let distinct: HashSet<_> = indices.iter().collect();
+        assert_eq!(distinct.len(), indices.len());
+        // ...and not handed out in order, so they cannot link credentials.
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        let strides: HashSet<_> = sorted.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(strides.len() > 1, "indices form an arithmetic sequence");
     }
 
     #[test]
