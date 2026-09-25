@@ -44,6 +44,11 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 # CBOR (for mdoc)
 ciborium = "0.2"
 
+# X.509 parsing, for certificate chain validation
+x509-cert = "0.2"
+sha1 = "0.10"
+time = "0.3"
+
 # Status list compression
 flate2 = "1"
 

@@ -18,6 +18,9 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 base64ct = { workspace = true }
 ciborium = { workspace = true }
+x509-cert = { workspace = true }
+sha1 = { workspace = true }
+time = { workspace = true }
 rcgen = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
