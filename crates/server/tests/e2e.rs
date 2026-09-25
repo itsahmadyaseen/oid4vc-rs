@@ -12,6 +12,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use oid4vc_crypto::keys::{EcdsaP256KeyPair, KeyPair};
+use oid4vc_crypto::mdoc;
 use oid4vc_issuer::state::IssuerState;
 use oid4vc_server::{build_router, AppState, ServerConfig, ENDPOINTS};
 use serde_json::Value;
@@ -145,24 +146,40 @@ const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 /// PAR, then the consent page, then the user's `decision`. Returns the
 /// redirect back to the wallet.
 async fn authorize(app: &Router, wallet: &HaipWallet, decision: &str) -> url::Url {
+    // Form-encoded, with authorization_details as a JSON string, the way the
+    // conformance suite sends it.
+    let details = r#"[{"type":"openid_credential","credential_configuration_id":"IdentityCredential_SD_JWT_VC"}]"#;
+    authorize_with(
+        app,
+        wallet,
+        decision,
+        &format!("authorization_details={}", enc(details)),
+    )
+    .await
+}
+
+/// [`authorize`], asking for the credential with `grant`: an
+/// `authorization_details` or a `scope` form parameter.
+async fn authorize_with(
+    app: &Router,
+    wallet: &HaipWallet,
+    decision: &str,
+    grant: &str,
+) -> url::Url {
     let challenge = {
         use base64ct::Encoding;
         use sha2::Digest;
         base64ct::Base64UrlUnpadded::encode_string(&sha2::Sha256::digest(PKCE_VERIFIER.as_bytes()))
     };
-    // Form-encoded, with authorization_details as a JSON string, the way the
-    // conformance suite sends it.
-    let details = r#"[{"type":"openid_credential","credential_configuration_id":"IdentityCredential_SD_JWT_VC"}]"#;
     let par = wallet
         .post_authenticated(
             app,
             "/authorize/par",
             &format!(
                 "response_type=code&client_id={}&redirect_uri={}&state=wallet-state-1\
-                 &code_challenge={challenge}&code_challenge_method=S256&authorization_details={}",
+                 &code_challenge={challenge}&code_challenge_method=S256&{grant}",
                 enc(&wallet.client_id),
                 enc(REDIRECT_URI),
-                enc(details),
             ),
         )
         .await;
@@ -215,6 +232,8 @@ struct Res {
     status: StatusCode,
     headers: axum::http::HeaderMap,
     body: String,
+    /// The body as sent, for binary responses (CBOR, DER).
+    bytes: Vec<u8>,
 }
 
 impl Res {
@@ -238,6 +257,7 @@ async fn send(app: &Router, request: Request<Body>) -> Res {
         status,
         headers,
         body: String::from_utf8_lossy(&bytes).to_string(),
+        bytes: bytes.to_vec(),
     }
 }
 
@@ -289,7 +309,30 @@ fn wallet_proof(holder: &dyn KeyPair, nonce: &str, audience: &str) -> String {
 
 /// Walk offer → token → credential, returning (sd_jwt, holder key).
 async fn obtain_credential(app: &Router) -> (String, EcdsaP256KeyPair) {
-    let offer = get(app, "/credential_offer").await.json();
+    obtain(app, "IdentityCredential_SD_JWT_VC").await
+}
+
+/// Walk offer → token → credential for an mDL, returning its `IssuerSigned`
+/// bytes and the holder key.
+async fn obtain_mdl(app: &Router) -> (Vec<u8>, EcdsaP256KeyPair) {
+    use base64ct::Encoding;
+    let (credential, holder) = obtain(app, MDL).await;
+    let issuer_signed = base64ct::Base64UrlUnpadded::decode_vec(&credential)
+        .expect("an mdoc credential is base64url (OID4VCI 1.0 A.2.4)");
+    (issuer_signed, holder)
+}
+
+const MDL: &str = "mDL_mso_mdoc";
+
+/// Walk offer → token → credential for `config_id`, returning the
+/// credential as the endpoint sent it, and the holder key.
+async fn obtain(app: &Router, config_id: &str) -> (String, EcdsaP256KeyPair) {
+    let offer = get(
+        app,
+        &format!("/credential_offer?credential_configuration_id={config_id}"),
+    )
+    .await
+    .json();
     let pre_auth = offer["credential_offer"]["grants"]
         ["urn:ietf:params:oauth:grant-type:pre-authorized_code"]["pre-authorized_code"]
         .as_str()
@@ -328,7 +371,7 @@ async fn obtain_credential(app: &Router) -> (String, EcdsaP256KeyPair) {
         app,
         "/credential",
         serde_json::json!({
-            "credential_configuration_id": "IdentityCredential_SD_JWT_VC",
+            "credential_configuration_id": config_id,
             "proofs": { "jwt": [proof] },
         }),
         Some(&access_token),
@@ -341,11 +384,16 @@ async fn obtain_credential(app: &Router) -> (String, EcdsaP256KeyPair) {
         credential.body
     );
 
-    let sd_jwt = credential.json()["credentials"][0]["credential"]
+    let credential = credential.json()["credentials"][0]["credential"]
         .as_str()
         .unwrap()
         .to_string();
-    (sd_jwt, holder)
+    (credential, holder)
+}
+
+/// The IACA root every mdoc this test app issues chains to.
+fn iaca(state: &AppState) -> Vec<Vec<u8>> {
+    vec![state.issuer_pki.trust_anchor.clone()]
 }
 
 /// Fetch a fresh `c_nonce` from the Nonce Endpoint, as a 1.0 wallet does.
@@ -481,7 +529,7 @@ async fn pre_authorized_code_flow_issues_a_bound_credential() {
         .unwrap()
         .header;
     assert_eq!(header.typ.as_deref(), Some("dc+sd-jwt"));
-    assert_eq!(header.x5c, Some(state.issuer_certificate.x5c()));
+    assert_eq!(header.x5c, Some(state.issuer_pki.leaf.x5c()));
 
     assert_eq!(verified.claims["given_name"], "John");
     assert_eq!(verified.claims["family_name"], "Doe");
@@ -583,6 +631,125 @@ async fn haip_authorization_code_flow_issues_a_credential() {
         .await;
     assert_eq!(issued.status, StatusCode::OK, "{}", issued.body);
     assert!(issued.json()["credentials"][0]["credential"].is_string());
+}
+
+#[tokio::test]
+async fn pre_authorized_code_flow_issues_a_bound_mdl() {
+    let (app, state) = test_app();
+    let (issuer_signed, holder) = obtain_mdl(&app).await;
+
+    // What a wallet checks on receipt: the chain to the IACA, the MSO
+    // signature, every element digest, and the validity period.
+    let mdl =
+        mdoc::verify_issuer_signed(&issuer_signed, &iaca(&state), chrono::Utc::now()).unwrap();
+    assert_eq!(mdl.doc_type, mdoc::MDL_DOCTYPE);
+    assert_eq!(mdl.signer_certificate, state.issuer_pki.mdoc_signer.der());
+
+    // Bound to the key from the proof.
+    assert_eq!(mdl.device_key.x, holder.public_jwk().x);
+
+    // Revocable through the mdoc list, not the SD-JWT VC one.
+    let status = mdl.status.as_ref().expect("an mDL carries an MSO status");
+    assert_eq!(status.uri, format!("{ISSUER}/status/mdoc"));
+
+    // Every element the metadata promises is there.
+    for element in oid4vc_issuer::metadata::MDL_ELEMENTS {
+        assert!(
+            mdl.claim(mdoc::MDL_NAMESPACE, element).is_some(),
+            "missing {element}"
+        );
+    }
+    assert_eq!(
+        mdl.claim(mdoc::MDL_NAMESPACE, "given_name").unwrap(),
+        "John"
+    );
+}
+
+/// HAIP with `scope`, the other way a wallet names what it wants, and the
+/// mDL: the token carries no credential_identifiers, so the wallet sends the
+/// configuration id.
+#[tokio::test]
+async fn haip_authorization_code_flow_issues_an_mdl() {
+    let (app, state) = test_app();
+    let wallet = HaipWallet::new("wallet-1");
+
+    let redirect = authorize_with(&app, &wallet, "approve", "scope=org.iso.18013.5.1.mDL").await;
+    let code = query_param(&redirect, "code").expect("redirect carries a code");
+    let token = wallet
+        .post_authenticated(&app, "/token", &redeem_form(&code))
+        .await;
+    assert_eq!(token.status, StatusCode::OK, "{}", token.body);
+    let access_token = token.json()["access_token"].as_str().unwrap().to_string();
+
+    let holder = EcdsaP256KeyPair::generate().unwrap();
+    let issued = wallet
+        .request_credential(
+            &app,
+            &access_token,
+            serde_json::json!({
+                "credential_configuration_id": MDL,
+                "proofs": { "jwt": [wallet_proof(&holder, &fetch_nonce(&app).await, ISSUER)] },
+            }),
+        )
+        .await;
+    assert_eq!(issued.status, StatusCode::OK, "{}", issued.body);
+
+    use base64ct::Encoding;
+    let issuer_signed = base64ct::Base64UrlUnpadded::decode_vec(
+        issued.json()["credentials"][0]["credential"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let mdl =
+        mdoc::verify_issuer_signed(&issuer_signed, &iaca(&state), chrono::Utc::now()).unwrap();
+    assert_eq!(mdl.device_key.x, holder.public_jwk().x);
+}
+
+/// The whole mdoc loop: issued over HTTP, presented with selective
+/// disclosure over an OpenID4VP session transcript, verified by a relying
+/// party that trusts only the IACA root.
+#[tokio::test]
+async fn issued_mdl_can_be_presented_selectively() {
+    let (app, state) = test_app();
+    let (issuer_signed, holder) = obtain_mdl(&app).await;
+
+    let transcript = |nonce: &str| {
+        mdoc::oid4vp_session_transcript(
+            "x509_hash:verifier",
+            nonce,
+            None,
+            "https://verifier.example.com/response",
+        )
+        .unwrap()
+    };
+    let presented = mdoc::present(
+        &issuer_signed,
+        &[(mdoc::MDL_NAMESPACE, "age_over_18")],
+        &transcript("nonce-1"),
+        &holder,
+    )
+    .unwrap();
+
+    let docs = mdoc::verify_device_response(
+        &presented,
+        &transcript("nonce-1"),
+        &iaca(&state),
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    let revealed = &docs[0].claims[mdoc::MDL_NAMESPACE];
+    assert_eq!(revealed.len(), 1, "only what was asked is revealed");
+    assert_eq!(revealed["age_over_18"], true);
+
+    // The same presentation, replayed into another session, is refused.
+    assert!(mdoc::verify_device_response(
+        &presented,
+        &transcript("nonce-2"),
+        &iaca(&state),
+        chrono::Utc::now()
+    )
+    .is_err());
 }
 
 #[tokio::test]
@@ -948,6 +1115,33 @@ async fn status_endpoints_publish_both_formats() {
     );
 }
 
+/// The MSO revocation list is a Status List Token in CWT format, signed
+/// under the revocation list signer, which chains to the IACA root.
+#[tokio::test]
+async fn mdoc_revocation_list_is_a_signed_cwt() {
+    let (app, state) = test_app();
+
+    let res = get(&app, "/status/mdoc").await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(
+        res.headers.get("content-type").unwrap(),
+        "application/statuslist+cwt"
+    );
+    let list = mdoc::verify_status_list_cwt(&res.bytes, &iaca(&state), chrono::Utc::now())
+        .expect("the list verifies against the IACA root");
+    assert_eq!(list.uri, format!("{ISSUER}/status/mdoc"), "sub is the URI");
+    assert_eq!(list.bits, 1, "ISO/IEC 18013-5 requires one bit per mdoc");
+
+    // The CRL the document signer certificate points at is published.
+    let crl = get(&app, "/iaca.crl").await;
+    assert_eq!(crl.status, StatusCode::OK);
+    assert_eq!(
+        crl.headers.get("content-type").unwrap(),
+        "application/pkix-crl"
+    );
+    assert_eq!(crl.bytes, state.issuer_pki.crl);
+}
+
 #[tokio::test]
 async fn admin_endpoints_require_a_token() {
     let (app, _state) = test_app();
@@ -999,4 +1193,50 @@ async fn revoking_an_issued_credential_flips_its_published_bit() {
         .unwrap();
     let list = oid4vc_status::status_list_2021::StatusList::decode(encoded, 100_000).unwrap();
     assert!(list.get(index).unwrap(), "index {index} should be revoked");
+}
+
+/// Revoking an mdoc sets its bit in the published CWT, and only there.
+#[tokio::test]
+async fn revoking_an_issued_mdl_flips_its_bit() {
+    use base64ct::Encoding;
+    let (app, state) = test_app();
+    let (issuer_signed, _holder) = obtain_mdl(&app).await;
+    let index = mdoc::verify_issuer_signed(&issuer_signed, &iaca(&state), chrono::Utc::now())
+        .unwrap()
+        .status
+        .unwrap()
+        .idx;
+
+    let bit = |bytes: &[u8]| {
+        let list = mdoc::verify_status_list_cwt(bytes, &iaca(&state), chrono::Utc::now()).unwrap();
+        oid4vc_status::token_status_list::TokenStatusListImpl::decode(
+            &base64ct::Base64UrlUnpadded::encode_string(&list.lst),
+            100_000,
+            list.bits,
+        )
+        .unwrap()
+        .get(index)
+        .unwrap()
+    };
+    assert_eq!(bit(&get(&app, "/status/mdoc").await.bytes), 0);
+
+    // A 1-bit list has no "suspended".
+    let suspend = post_json(
+        &app,
+        "/admin/status/suspend",
+        serde_json::json!({ "index": index, "format": "mso_mdoc" }),
+        Some(ADMIN_TOKEN),
+    )
+    .await;
+    assert_eq!(suspend.status, StatusCode::BAD_REQUEST, "{}", suspend.body);
+
+    let revoke = post_json(
+        &app,
+        "/admin/status/revoke",
+        serde_json::json!({ "index": index, "format": "mso_mdoc" }),
+        Some(ADMIN_TOKEN),
+    )
+    .await;
+    assert_eq!(revoke.status, StatusCode::OK, "{}", revoke.body);
+    assert_eq!(bit(&get(&app, "/status/mdoc").await.bytes), 1);
 }

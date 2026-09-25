@@ -14,7 +14,9 @@ pub struct ServerConfig {
     pub p256_key_path: Option<PathBuf>,
     /// Where the Ed25519 signing key is stored (PKCS#8 PEM).
     pub ed25519_key_path: Option<PathBuf>,
-    /// The X.509 certificate for the P-256 key, sent in `x5c` (PEM).
+    /// The X.509 certificates for the P-256 key, as one PEM bundle: the `x5c`
+    /// leaf, the mdoc document signer, the mdoc revocation list signer, the
+    /// trust anchor they chain to, and that anchor's CRL.
     ///
     /// Absent means a development CA is minted and this file written.
     pub cert_path: Option<PathBuf>,

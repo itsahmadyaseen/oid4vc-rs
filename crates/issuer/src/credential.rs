@@ -1,12 +1,16 @@
 //! Credential endpoint: proof-of-possession validation and credential issuance.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use base64ct::Encoding;
+use base64ct::{Base64UrlUnpadded, Encoding};
+use chrono::NaiveDate;
 use serde_json::Value;
 use thiserror::Error;
 
+use oid4vc_crypto::cose::Value as Cbor;
 use oid4vc_crypto::jwk::Jwk;
+use oid4vc_crypto::mdoc::{self, StatusListRef};
+use oid4vc_crypto::x509::IssuerCertificate;
 use oid4vc_types::oid4vci::{
     CredentialConfiguration, CredentialIssuerMetadata, CredentialRequest, CredentialResponse,
     IssuedCredential,
@@ -16,6 +20,19 @@ use crate::state::{AccessGrant, IssuerState};
 
 /// How far a proof JWT's `iat` may drift from the issuer's clock, in seconds.
 const PROOF_MAX_AGE_SECS: i64 = 300;
+
+/// How long an MSO is valid for, at most. The document signer certificate's
+/// own expiry caps it further (ISO/IEC 18013-5 §9.3.1).
+const MSO_VALIDITY_DAYS: i64 = 365;
+
+/// The demo subject's date of birth, the same in every format.
+const DEMO_BIRTH_DATE: &str = "1990-01-01";
+
+/// Who the demo mDL names as its issuing authority.
+const ISSUING_AUTHORITY: &str = "oid4vc-rs Development Issuing Authority";
+
+/// A neutral placeholder photo for the mDL's mandatory `portrait` (JPEG).
+const PORTRAIT_JPEG: &[u8] = include_bytes!("../assets/portrait.jpg");
 
 /// Credential endpoint errors. Each maps onto an OID4VCI §8.3.1.2 error code.
 #[derive(Debug, Error)]
@@ -60,6 +77,19 @@ impl CredentialError {
 /// Allocates the `status` claim for one credential, or `None` for no status.
 pub type StatusAllocator<'a> = dyn Fn() -> Result<Option<Value>, String> + 'a;
 
+/// Allocates the MSO `status` entry for one mdoc, or `None` for no status.
+pub type MdocStatusAllocator<'a> = dyn Fn() -> Result<Option<StatusListRef>, String> + 'a;
+
+/// What mdoc issuance needs beyond the issuer key.
+pub struct MdocSigner<'a> {
+    /// The document signer certificate for the issuer key (ISO/IEC 18013-5
+    /// Table B.3). It is the MSO's `x5chain`, it bounds the MSO's validity,
+    /// and its countryName is the mDL's `issuing_country`.
+    pub certificate: &'a IssuerCertificate,
+    /// Allocates an MSO revocation list entry per mdoc.
+    pub allocate_status: &'a MdocStatusAllocator<'a>,
+}
+
 /// Everything the credential endpoint needs beyond the request itself.
 pub struct IssuanceContext<'a> {
     /// The key the credential is signed with.
@@ -72,6 +102,8 @@ pub struct IssuanceContext<'a> {
     pub allocate_status: &'a StatusAllocator<'a>,
     /// The issuer key's certificate chain for the `x5c` header, leaf first.
     pub x5c: Option<Vec<String>>,
+    /// How mdocs are signed. `None` means this issuer cannot issue them.
+    pub mdoc: Option<MdocSigner<'a>>,
 }
 
 /// Process a credential request.
@@ -148,7 +180,7 @@ pub fn process_credential_request(
         .map(|holder_jwk| {
             let credential = match config.format.as_str() {
                 "dc+sd-jwt" => issue_sd_jwt_credential(config, ctx, holder_jwk)?,
-                "mso_mdoc" => issue_mdoc_credential(config, ctx.issuer_key)?,
+                "mso_mdoc" => issue_mdoc_credential(config, ctx, holder_jwk)?,
                 other => {
                     return Err(CredentialError::UnsupportedFormat(format!(
                         "{config_id} has format {other}"
@@ -336,7 +368,7 @@ fn issue_sd_jwt_credential(
     disclosable_claims.insert("family_name".to_string(), Value::String("Doe".to_string()));
     disclosable_claims.insert(
         "birth_date".to_string(),
-        Value::String("1990-01-01".to_string()),
+        Value::String(DEMO_BIRTH_DATE.to_string()),
     );
 
     // The `cnf` claim is what makes this credential non-bearer: only the holder
@@ -358,44 +390,99 @@ fn issue_sd_jwt_credential(
     Ok(Value::String(sd_jwt))
 }
 
-/// Issue an ISO 18013-5 mdoc credential.
+/// Issue an ISO/IEC 18013-5 mDL bound to the holder's key.
+///
+/// The key from the proof becomes the MSO's device key, so only its holder
+/// can later present the mDL. The Credential Endpoint returns the
+/// `IssuerSigned` structure base64url-encoded (OID4VCI 1.0 Appendix A.2.4).
 fn issue_mdoc_credential(
     config: &CredentialConfiguration,
-    issuer_key: &dyn oid4vc_crypto::keys::KeyPair,
+    ctx: &IssuanceContext<'_>,
+    holder_jwk: &Jwk,
 ) -> Result<Value, CredentialError> {
-    let doctype = config.doctype.as_deref().unwrap_or("org.iso.18013.5.1.mDL");
+    let signer = ctx.mdoc.as_ref().ok_or_else(|| {
+        CredentialError::IssuanceError("no mdoc document signer is configured".to_string())
+    })?;
+    let doc_type = config.doctype.as_deref().unwrap_or_default();
+    if doc_type != mdoc::MDL_DOCTYPE {
+        return Err(CredentialError::UnsupportedFormat(format!(
+            "mso_mdoc doctype '{doc_type}'"
+        )));
+    }
+    let country = signer.certificate.subject_country().ok_or_else(|| {
+        CredentialError::IssuanceError(
+            "the document signer certificate names no country".to_string(),
+        )
+    })?;
 
-    // Build data elements
-    let elements = vec![
-        oid4vc_crypto::cose::DataElement {
-            identifier: "family_name".to_string(),
-            value: b"\"Doe\"".to_vec(),
-            random: rand::random::<[u8; 32]>().to_vec(),
-        },
-        oid4vc_crypto::cose::DataElement {
-            identifier: "given_name".to_string(),
-            value: b"\"John\"".to_vec(),
-            random: rand::random::<[u8; 32]>().to_vec(),
-        },
-    ];
-
-    // Build MSO digests
-    let _digests = oid4vc_crypto::cose::build_mso_digests("org.iso.18013.5.1", &elements)
+    let now = chrono::Utc::now();
+    let request = mdoc::IssueRequest {
+        doc_type,
+        namespaces: BTreeMap::from([(
+            mdoc::MDL_NAMESPACE.to_string(),
+            mdl_elements(&country, now.date_naive()),
+        )]),
+        device_key: holder_jwk,
+        valid_from: now,
+        valid_until: (now + chrono::Duration::days(MSO_VALIDITY_DAYS))
+            .min(signer.certificate.not_after()),
+        status: (signer.allocate_status)().map_err(CredentialError::IssuanceError)?,
+        x5chain: vec![signer.certificate.der().to_vec()],
+    };
+    let issuer_signed = mdoc::issue(&request, ctx.issuer_key)
         .map_err(|e| CredentialError::IssuanceError(e.to_string()))?;
 
-    // Sign with COSE_Sign1
-    let mso_payload = serde_json::to_vec(&serde_json::json!({
-        "docType": doctype,
-        "version": "1.0",
-    }))
-    .map_err(|e| CredentialError::IssuanceError(e.to_string()))?;
+    Ok(Value::String(Base64UrlUnpadded::encode_string(
+        &issuer_signed,
+    )))
+}
 
-    let cose_signed =
-        oid4vc_crypto::cose::sign_cose_sign1(issuer_key, &mso_payload, Some("application/mdoc"))
-            .map_err(|e| CredentialError::IssuanceError(e.to_string()))?;
+/// The demo subject's mDL data elements, in the order
+/// [`crate::metadata::MDL_ELEMENTS`] lists them.
+///
+/// A production issuer reads these from the licence holder's record.
+fn mdl_elements(issuing_country: &str, today: NaiveDate) -> Vec<(String, Cbor)> {
+    let text = |s: &str| Cbor::Text(s.to_string());
+    let birth_date = NaiveDate::parse_from_str(DEMO_BIRTH_DATE, "%Y-%m-%d").expect("valid date");
+    let expiry_date = today
+        .checked_add_months(chrono::Months::new(5 * 12))
+        .expect("date in range");
+    let age = today.years_since(birth_date).unwrap_or(0);
 
-    let encoded = base64ct::Base64UrlUnpadded::encode_string(&cose_signed);
-    Ok(Value::String(encoded))
+    let mut elements = vec![
+        ("family_name", text("Doe")),
+        ("given_name", text("John")),
+        ("birth_date", mdoc::full_date(birth_date)),
+        ("issue_date", mdoc::full_date(today)),
+        ("expiry_date", mdoc::full_date(expiry_date)),
+        // Table B.3: must equal the document signer's countryName.
+        ("issuing_country", text(issuing_country)),
+        ("issuing_authority", text(ISSUING_AUTHORITY)),
+        (
+            "document_number",
+            text(&format!("{:09}", rand::random::<u32>() % 1_000_000_000)),
+        ),
+        ("portrait", Cbor::Bytes(PORTRAIT_JPEG.to_vec())),
+        (
+            "driving_privileges",
+            Cbor::Array(vec![Cbor::Map(vec![
+                (text("vehicle_category_code"), text("B")),
+                (text("issue_date"), mdoc::full_date(today)),
+                (text("expiry_date"), mdoc::full_date(expiry_date)),
+            ])]),
+        ),
+        // The sign a country's vehicles carry abroad. A development issuer
+        // is no country, so it repeats the user-assigned country code.
+        ("un_distinguishing_sign", text(issuing_country)),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value))
+    .collect::<Vec<_>>();
+    // ISO/IEC 18013-5 §7.2.5: true when the holder is at least NN today.
+    for nn in [18, 21] {
+        elements.push((format!("age_over_{nn}"), Cbor::Bool(age >= nn)));
+    }
+    elements
 }
 
 // ---------------------------------------------------------------------------
@@ -434,14 +521,20 @@ mod tests {
             metadata,
             allocate_status: &no_status,
             x5c: None,
+            mdoc: None,
         }
     }
 
     /// A state holding one access token for `SD_JWT` and one c_nonce.
     fn ready_state() -> InMemoryIssuerState {
+        state_granting(SD_JWT)
+    }
+
+    /// A state holding one access token for `config_id` and one c_nonce.
+    fn state_granting(config_id: &str) -> InMemoryIssuerState {
         let state = InMemoryIssuerState::new();
         let grant = AccessGrant {
-            credential_configuration_ids: vec![SD_JWT.to_string()],
+            credential_configuration_ids: vec![config_id.to_string()],
             credential_identifiers: HashMap::new(),
             dpop_jkt: None,
         };
@@ -708,6 +801,7 @@ mod tests {
             metadata: &metadata,
             allocate_status: &allocate,
             x5c: None,
+            mdoc: None,
         };
 
         let jwt = wallet_proof(&holder_key, "nonce-abc", ISSUER);
@@ -719,5 +813,130 @@ mod tests {
         let verified = oid4vc_crypto::sd_jwt::verify_sd_jwt_vc(&sd_jwt, &issuer_key).unwrap();
 
         assert_eq!(verified.payload["status"]["status_list"]["idx"], 7);
+    }
+
+    const MDL: &str = "mDL_mso_mdoc";
+
+    /// Issue one mDL through the credential endpoint, returning its
+    /// `IssuerSigned` bytes and the development PKI it was signed under.
+    fn issue_mdl(
+        issuer_key: &EcdsaP256KeyPair,
+        holder_key: &EcdsaP256KeyPair,
+    ) -> (Vec<u8>, oid4vc_crypto::x509::IssuerPki) {
+        let (state, metadata) = (state_granting(MDL), metadata());
+        let pki = oid4vc_crypto::x509::IssuerPki::mint_development(
+            &oid4vc_crypto::x509::DevelopmentPkiParams {
+                key_pkcs8_pem: &issuer_key.to_pkcs8_pem().unwrap(),
+                host: "issuer.example.com",
+                issuer_url: ISSUER,
+            },
+        )
+        .unwrap();
+        let allocate = || {
+            Ok(Some(StatusListRef {
+                idx: 42,
+                uri: "https://issuer.example.com/status/mdoc".to_string(),
+            }))
+        };
+        let ctx = IssuanceContext {
+            mdoc: Some(MdocSigner {
+                certificate: &pki.mdoc_signer,
+                allocate_status: &allocate,
+            }),
+            ..ctx(issuer_key, &metadata)
+        };
+
+        let mut request = request_with_proofs(&[&wallet_proof(holder_key, "nonce-abc", ISSUER)]);
+        request.credential_configuration_id = Some(MDL.to_string());
+        let response = process_credential_request(&request, "token-123", &ctx, &state).unwrap();
+
+        let issuer_signed =
+            Base64UrlUnpadded::decode_vec(&first_credential(response)).expect("base64url");
+        (issuer_signed, pki)
+    }
+
+    #[test]
+    fn test_issues_mdl_bound_to_holder_key() {
+        let issuer_key = EcdsaP256KeyPair::generate().unwrap();
+        let holder_key = EcdsaP256KeyPair::generate().unwrap();
+        let (issuer_signed, pki) = issue_mdl(&issuer_key, &holder_key);
+
+        let mdl = mdoc::verify_issuer_signed(
+            &issuer_signed,
+            std::slice::from_ref(&pki.trust_anchor),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+
+        assert_eq!(mdl.doc_type, mdoc::MDL_DOCTYPE);
+        // The device key is the proof key: only the holder can present it.
+        assert_eq!(mdl.device_key.x, holder_key.public_jwk().x);
+        assert_eq!(mdl.device_key.y, holder_key.public_jwk().y);
+        assert_eq!(mdl.signer_certificate, pki.mdoc_signer.der());
+        assert_eq!(mdl.status.unwrap().idx, 42);
+        assert!(mdl.valid_until <= pki.mdoc_signer.not_after());
+    }
+
+    #[test]
+    fn test_mdl_carries_every_element_the_metadata_promises() {
+        let issuer_key = EcdsaP256KeyPair::generate().unwrap();
+        let (issuer_signed, pki) = issue_mdl(&issuer_key, &EcdsaP256KeyPair::generate().unwrap());
+        let mdl = mdoc::verify_issuer_signed(
+            &issuer_signed,
+            std::slice::from_ref(&pki.trust_anchor),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+
+        let issued: Vec<&str> = mdl.claims[mdoc::MDL_NAMESPACE]
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut promised = crate::metadata::MDL_ELEMENTS.to_vec();
+        promised.sort_unstable();
+        assert_eq!(issued, promised);
+
+        let claim = |name: &str| mdl.claim(mdoc::MDL_NAMESPACE, name).unwrap().clone();
+        // Table B.3: issuing_country is the document signer's countryName.
+        assert_eq!(claim("issuing_country"), "ZZ");
+        assert_eq!(claim("birth_date"), DEMO_BIRTH_DATE);
+        assert_eq!(claim("age_over_18"), true);
+        assert_eq!(claim("age_over_21"), true);
+        assert_eq!(claim("driving_privileges")[0]["vehicle_category_code"], "B");
+    }
+
+    #[test]
+    fn test_age_attestations_follow_the_birth_date() {
+        let elements = |today: &str| {
+            let today = NaiveDate::parse_from_str(today, "%Y-%m-%d").unwrap();
+            mdl_elements("ZZ", today)
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("age_over_"))
+                .map(|(name, value)| (name, value.as_bool().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let pair = |a: bool, b: bool| {
+            vec![
+                ("age_over_18".to_string(), a),
+                ("age_over_21".to_string(), b),
+            ]
+        };
+        // Born 1990-01-01: 18 on 2008-01-01, 21 on 2011-01-01.
+        assert_eq!(elements("2007-12-31"), pair(false, false));
+        assert_eq!(elements("2008-01-01"), pair(true, false));
+        assert_eq!(elements("2011-01-01"), pair(true, true));
+    }
+
+    #[test]
+    fn test_mdl_without_a_document_signer_is_a_server_error() {
+        let (state, metadata) = (state_granting(MDL), metadata());
+        let issuer_key = EcdsaP256KeyPair::generate().unwrap();
+        let holder_key = EcdsaP256KeyPair::generate().unwrap();
+
+        let mut request = request_with_proofs(&[&wallet_proof(&holder_key, "nonce-abc", ISSUER)]);
+        request.credential_configuration_id = Some(MDL.to_string());
+        let result =
+            process_credential_request(&request, "token-123", &ctx(&issuer_key, &metadata), &state);
+        assert_eq!(result.unwrap_err().code(), "server_error");
     }
 }

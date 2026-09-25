@@ -41,10 +41,11 @@ base64ct = { version = "1", features = ["alloc"] }
 # X.509 certificates for the x5c chain HAIP requires
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
-# CBOR (for mdoc)
+# CBOR and COSE (for mdoc, ISO/IEC 18013-5)
 ciborium = "0.2"
+coset = "0.3"
 
-# X.509 parsing, for certificate chain validation
+# X.509 parsing, for mdoc x5chain validation
 x509-cert = "0.2"
 sha1 = "0.10"
 time = "0.3"

@@ -17,6 +17,24 @@ pub const BATCH_SIZE: usize = 10;
 /// COSE algorithm identifier for ES256 (RFC 9053), as `mso_mdoc` metadata uses.
 const COSE_ES256: i64 = -7;
 
+/// The mDL data elements every issued mDL carries: all eleven mandatory ones
+/// of ISO/IEC 18013-5 Table 5, then two age attestations.
+pub const MDL_ELEMENTS: &[&str] = &[
+    "family_name",
+    "given_name",
+    "birth_date",
+    "issue_date",
+    "expiry_date",
+    "issuing_country",
+    "issuing_authority",
+    "document_number",
+    "portrait",
+    "driving_privileges",
+    "un_distinguishing_sign",
+    "age_over_18",
+    "age_over_21",
+];
+
 /// A claims description for a top-level (SD-JWT) or namespaced (mdoc) claim.
 fn claim(path: &[&str], mandatory: bool) -> ClaimDescription {
     ClaimDescription {
@@ -102,7 +120,8 @@ pub fn build_metadata(config: &MetadataConfig) -> CredentialIssuerMetadata {
         CredentialConfiguration {
             format: "mso_mdoc".to_string(),
             scope: Some("org.iso.18013.5.1.mDL".to_string()),
-            cryptographic_binding_methods_supported: Some(vec!["jwk".to_string()]),
+            // The holder key becomes the MSO's COSE_Key (OID4VCI 1.0 A.2.2).
+            cryptographic_binding_methods_supported: Some(vec!["cose_key".to_string()]),
             credential_signing_alg_values_supported: Some(vec![COSE_ES256.into()]),
             proof_types_supported: Some(mdoc_proof_types),
             credential_metadata: Some(CredentialMetadata {
@@ -117,17 +136,10 @@ pub fn build_metadata(config: &MetadataConfig) -> CredentialIssuerMetadata {
                     text_color: Some("#ffffff".to_string()),
                 }]),
                 claims: Some(
-                    [
-                        "family_name",
-                        "given_name",
-                        "birth_date",
-                        "document_number",
-                        "issuing_authority",
-                        "expiry_date",
-                    ]
-                    .iter()
-                    .map(|name| claim(&["org.iso.18013.5.1", name], true))
-                    .collect(),
+                    MDL_ELEMENTS
+                        .iter()
+                        .map(|name| claim(&["org.iso.18013.5.1", name], true))
+                        .collect(),
                 ),
             }),
             vct: None,

@@ -29,6 +29,9 @@ pub enum ManagerError {
     LockPoisoned,
 }
 
+/// Capacity of every list, in credentials.
+const LIST_CAPACITY: usize = 100_000;
+
 /// Internal representation of a managed status list.
 struct ManagedList {
     sl2021: StatusList,
@@ -38,13 +41,40 @@ struct ManagedList {
     allocated: HashSet<usize>,
 }
 
+/// The MSO revocation list for mdocs.
+///
+/// ISO/IEC 18013-5 §12.3.6.5 requires one bit per mdoc, so an mdoc can be
+/// revoked but not suspended, and it cannot share the 2-bit lists above.
+struct MdocList {
+    tsl: TokenStatusListImpl,
+    allocated: HashSet<usize>,
+}
+
 /// Unified status manager for credential lifecycle management.
 ///
 /// Manages both StatusList2021 and Token Status List for each purpose
-/// (revocation and suspension), ensuring consistency between them.
+/// (revocation and suspension), ensuring consistency between them, plus a
+/// separate revocation list for mdocs.
 pub struct StatusManager {
     lists: Mutex<HashMap<String, ManagedList>>,
+    mdoc: Mutex<MdocList>,
     issuer_url: Url,
+}
+
+/// Draw an unused index at random.
+///
+/// Sequential indices would let anyone who sees two credentials tell they
+/// were issued together (HAIP §6.1, Token Status List §12.5.1).
+fn draw_index(allocated: &mut HashSet<usize>, capacity: usize) -> Result<usize, ManagerError> {
+    if allocated.len() >= capacity {
+        return Err(ManagerError::NoAvailableIndex);
+    }
+    loop {
+        let candidate = rand::random::<usize>() % capacity;
+        if allocated.insert(candidate) {
+            return Ok(candidate);
+        }
+    }
 }
 
 impl StatusManager {
@@ -56,10 +86,10 @@ impl StatusManager {
         lists.insert(
             "revocation".to_string(),
             ManagedList {
-                sl2021: StatusList::new(100_000),
-                tsl: TokenStatusListImpl::new(100_000, 2).unwrap(),
+                sl2021: StatusList::new(LIST_CAPACITY),
+                tsl: TokenStatusListImpl::new(LIST_CAPACITY as u64, 2).unwrap(),
                 purpose: StatusPurpose::Revocation,
-                capacity: 100_000,
+                capacity: LIST_CAPACITY,
                 allocated: HashSet::new(),
             },
         );
@@ -68,16 +98,20 @@ impl StatusManager {
         lists.insert(
             "suspension".to_string(),
             ManagedList {
-                sl2021: StatusList::new(100_000),
-                tsl: TokenStatusListImpl::new(100_000, 2).unwrap(),
+                sl2021: StatusList::new(LIST_CAPACITY),
+                tsl: TokenStatusListImpl::new(LIST_CAPACITY as u64, 2).unwrap(),
                 purpose: StatusPurpose::Suspension,
-                capacity: 100_000,
+                capacity: LIST_CAPACITY,
                 allocated: HashSet::new(),
             },
         );
 
         Self {
             lists: Mutex::new(lists),
+            mdoc: Mutex::new(MdocList {
+                tsl: TokenStatusListImpl::new(LIST_CAPACITY as u64, 1).unwrap(),
+                allocated: HashSet::new(),
+            }),
             issuer_url,
         }
     }
@@ -85,10 +119,7 @@ impl StatusManager {
     /// Allocate a status entry for a new credential.
     ///
     /// Returns a `StatusList2021Entry` that should be embedded in the issued credential.
-    ///
-    /// Indices are drawn at random from the unused ones. Sequential indices
-    /// would let anyone who sees two credentials tell they were issued
-    /// together (HAIP §6.1, Token Status List §12.5.1).
+    /// Indices are drawn at random from the unused ones.
     pub fn allocate_entry(
         &self,
         purpose: StatusPurpose,
@@ -100,15 +131,7 @@ impl StatusManager {
             .get_mut(&list_id)
             .ok_or_else(|| ManagerError::ListNotFound(list_id.clone()))?;
 
-        if managed.allocated.len() >= managed.capacity {
-            return Err(ManagerError::NoAvailableIndex);
-        }
-        let index = loop {
-            let candidate = rand::random::<usize>() % managed.capacity;
-            if managed.allocated.insert(candidate) {
-                break candidate;
-            }
-        };
+        let index = draw_index(&mut managed.allocated, managed.capacity)?;
 
         let status_list_url = self
             .issuer_url
@@ -172,6 +195,31 @@ impl StatusManager {
             .map_err(|e| ManagerError::ListError(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Allocate an index in the mdoc revocation list, drawn at random.
+    pub fn allocate_mdoc_index(&self) -> Result<usize, ManagerError> {
+        let mut mdoc = self.mdoc.lock().map_err(|_| ManagerError::LockPoisoned)?;
+        draw_index(&mut mdoc.allocated, LIST_CAPACITY)
+    }
+
+    /// Revoke an mdoc by setting its bit.
+    pub fn revoke_mdoc(&self, index: usize) -> Result<(), ManagerError> {
+        let mut mdoc = self.mdoc.lock().map_err(|_| ManagerError::LockPoisoned)?;
+        mdoc.tsl
+            .set(index as u64, 1)
+            .map_err(|e| ManagerError::ListError(e.to_string()))
+    }
+
+    /// The mdoc revocation list as a Status List Token carries it: bits per
+    /// status (always 1) and the ZLIB-compressed array.
+    pub fn mdoc_status_list(&self) -> Result<(u8, Vec<u8>), ManagerError> {
+        let mdoc = self.mdoc.lock().map_err(|_| ManagerError::LockPoisoned)?;
+        let lst = mdoc
+            .tsl
+            .compress()
+            .map_err(|e| ManagerError::ListError(e.to_string()))?;
+        Ok((mdoc.tsl.bits_per_status(), lst))
     }
 
     /// Build a StatusList2021 credential for publishing.
@@ -241,6 +289,7 @@ impl StatusManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64ct::Encoding;
 
     #[test]
     fn test_allocate_entry() {
@@ -301,5 +350,27 @@ mod tests {
         let list =
             StatusList::decode(&credential.credential_subject.encoded_list, 100_000).unwrap();
         assert!(!list.get(index).unwrap());
+    }
+
+    #[test]
+    fn test_mdoc_list_is_one_bit_and_separate() {
+        let manager = StatusManager::new(Url::parse("https://issuer.example.com").unwrap());
+        let index = manager.allocate_mdoc_index().unwrap();
+        manager.revoke_mdoc(index).unwrap();
+
+        let (bits, lst) = manager.mdoc_status_list().unwrap();
+        assert_eq!(bits, 1);
+        let list = TokenStatusListImpl::decode(
+            &base64ct::Base64UrlUnpadded::encode_string(&lst),
+            LIST_CAPACITY as u64,
+            1,
+        )
+        .unwrap();
+        assert_eq!(list.get(index as u64).unwrap(), 1);
+
+        // Revoking an mdoc touches no SD-JWT VC list.
+        let tsl = manager.build_token_status_list("revocation").unwrap();
+        let revocation = TokenStatusListImpl::decode(&tsl.lst, LIST_CAPACITY as u64, 2).unwrap();
+        assert_eq!(revocation.get(index as u64).unwrap(), 0);
     }
 }

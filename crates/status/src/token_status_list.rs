@@ -117,18 +117,24 @@ impl TokenStatusListImpl {
         self.set(index, status as u8)
     }
 
-    /// Encode as a compressed, base64url-encoded string (the `lst` field).
+    /// Encode as a compressed, base64url-encoded string: the `lst` field of
+    /// a Status List Token in JWT format.
+    pub fn encode(&self) -> Result<String, TokenStatusListError> {
+        Ok(Base64UrlUnpadded::encode_string(&self.compress()?))
+    }
+
+    /// The compressed status array: the `lst` field of a Status List Token in
+    /// CWT format, which carries it as a byte string.
     ///
     /// The spec requires DEFLATE in the ZLIB format (RFC 1950), not gzip.
-    pub fn encode(&self) -> Result<String, TokenStatusListError> {
+    pub fn compress(&self) -> Result<Vec<u8>, TokenStatusListError> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
         encoder
             .write_all(&self.data)
             .map_err(|e| TokenStatusListError::Compression(e.to_string()))?;
-        let compressed = encoder
+        encoder
             .finish()
-            .map_err(|e| TokenStatusListError::Compression(e.to_string()))?;
-        Ok(Base64UrlUnpadded::encode_string(&compressed))
+            .map_err(|e| TokenStatusListError::Compression(e.to_string()))
     }
 
     /// Decode from a compressed, base64url-encoded string.

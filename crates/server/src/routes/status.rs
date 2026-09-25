@@ -7,15 +7,22 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use oid4vc_crypto::mdoc::{self, StatusListCwt};
+use oid4vc_crypto::x509;
 use serde::Deserialize;
 
 use crate::extract::FormOrJson;
 use crate::middleware::json_error;
 use crate::state::AppState;
 
+/// Where the mdoc revocation list is published.
+pub const MDOC_STATUS_PATH: &str = "/status/mdoc";
+
 /// Build the status routes.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route(MDOC_STATUS_PATH, get(get_mdoc_status_list))
+        .route(x509::CRL_PATH, get(get_crl))
         .route("/status/{id}", get(get_status_list))
         .route("/status/{id}/token", get(get_token_status_list))
         .route("/admin/status/revoke", post(revoke_credential))
@@ -65,7 +72,7 @@ async fn get_token_status_list(
     });
     let mut header =
         oid4vc_crypto::jws::build_header(state.primary_key.as_ref(), Some("statuslist+jwt"));
-    header.x5c = Some(state.issuer_certificate.x5c());
+    header.x5c = Some(state.issuer_pki.leaf.x5c());
 
     match oid4vc_crypto::jws::sign_compact(state.primary_key.as_ref(), &header, &claims) {
         Ok(jwt) => ([(header::CONTENT_TYPE, "application/statuslist+jwt")], jwt).into_response(),
@@ -77,11 +84,80 @@ async fn get_token_status_list(
     }
 }
 
+/// `GET /status/mdoc` — Serve the mdoc revocation list.
+///
+/// This is what the `status.status_list.uri` in an issued MSO points at: a
+/// Status List Token in CWT format with one bit per mdoc (ISO/IEC 18013-5
+/// §12.3.6.5), signed under the revocation list signer certificate.
+async fn get_mdoc_status_list(State(state): State<Arc<AppState>>) -> Response {
+    let (bits, lst) = match state.status_manager.mdoc_status_list() {
+        Ok(list) => list,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                &e.to_string(),
+            )
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let uri = state.url_for(MDOC_STATUS_PATH);
+    let list = StatusListCwt {
+        uri: uri.as_str(),
+        bits,
+        lst: &lst,
+        iat: now,
+        exp: now + chrono::Duration::hours(24),
+        ttl: Some(STATUS_LIST_TTL_SECS as u64),
+        x5chain: vec![state.issuer_pki.mdoc_status_signer.der().to_vec()],
+    };
+    match mdoc::sign_status_list_cwt(&list, state.primary_key.as_ref()) {
+        Ok(token) => ([(header::CONTENT_TYPE, mdoc::STATUS_LIST_CWT_TYPE)], token).into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &e.to_string(),
+        ),
+    }
+}
+
+/// `GET /iaca.crl` — Serve the trust anchor's certificate revocation list.
+///
+/// The mdoc document signer certificate names this as its CRL distribution
+/// point (ISO/IEC 18013-5 Table B.3).
+async fn get_crl(State(state): State<Arc<AppState>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/pkix-crl")],
+        state.issuer_pki.crl.clone(),
+    )
+        .into_response()
+}
+
 /// Request body for status update endpoints.
 #[derive(Deserialize)]
 struct StatusUpdateRequest {
     /// The status list index of the credential to update.
     index: usize,
+    /// The credential's format, which decides the list the index is in:
+    /// `mso_mdoc` for an mdoc, an SD-JWT VC otherwise.
+    #[serde(default)]
+    format: Option<String>,
+}
+
+impl StatusUpdateRequest {
+    fn is_mdoc(&self) -> bool {
+        self.format.as_deref() == Some("mso_mdoc")
+    }
+}
+
+/// The mdoc list has one bit per mdoc: revoked or not.
+fn reject_mdoc_suspension() -> Response {
+    json_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "an mdoc can be revoked but not suspended: its revocation list has one bit per mdoc",
+    )
 }
 
 /// Check the admin bearer token, returning an error response when it is wrong.
@@ -126,7 +202,12 @@ async fn revoke_credential(
         return response;
     }
 
-    match state.status_manager.revoke(request.index) {
+    let revoked = if request.is_mdoc() {
+        state.status_manager.revoke_mdoc(request.index)
+    } else {
+        state.status_manager.revoke(request.index)
+    };
+    match revoked {
         Ok(()) => Json(serde_json::json!({
             "status": "revoked",
             "index": request.index,
@@ -144,6 +225,9 @@ async fn suspend_credential(
 ) -> Response {
     if let Some(response) = reject_unauthorized_admin(&state, &headers) {
         return response;
+    }
+    if request.is_mdoc() {
+        return reject_mdoc_suspension();
     }
 
     match state.status_manager.suspend(request.index) {
@@ -164,6 +248,9 @@ async fn reinstate_credential(
 ) -> Response {
     if let Some(response) = reject_unauthorized_admin(&state, &headers) {
         return response;
+    }
+    if request.is_mdoc() {
+        return reject_mdoc_suspension();
     }
 
     match state.status_manager.reinstate(request.index) {

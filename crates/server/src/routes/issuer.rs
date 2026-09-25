@@ -9,9 +9,10 @@ use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use serde::Deserialize;
 
+use oid4vc_crypto::mdoc::StatusListRef;
 use oid4vc_issuer::authorization::{self, AuthorizationSession, ParContext};
 use oid4vc_issuer::client_attestation::{self, AttestedClient};
-use oid4vc_issuer::credential::{self, IssuanceContext};
+use oid4vc_issuer::credential::{self, IssuanceContext, MdocSigner};
 use oid4vc_issuer::dpop::{self, DpopContext};
 use oid4vc_issuer::offer::{self, OfferParams};
 use oid4vc_issuer::state::IssuerState;
@@ -521,12 +522,29 @@ async fn credential_endpoint(
         })))
     };
 
+    // An mdoc's revocation handle is a bit in the mdoc revocation list.
+    let mdoc_status_uri = state.url_for(crate::routes::status::MDOC_STATUS_PATH);
+    let allocate_mdoc_status = || {
+        let idx = state
+            .status_manager
+            .allocate_mdoc_index()
+            .map_err(|e| format!("could not allocate an mdoc status entry: {e}"))?;
+        Ok(Some(StatusListRef {
+            idx: idx as u64,
+            uri: mdoc_status_uri.to_string(),
+        }))
+    };
+
     let ctx = IssuanceContext {
         issuer_key: state.primary_key.as_ref(),
         issuer_url: &state.issuer_id,
         metadata: &state.metadata,
         allocate_status: &allocate_status,
-        x5c: Some(state.issuer_certificate.x5c()),
+        x5c: Some(state.issuer_pki.leaf.x5c()),
+        mdoc: Some(MdocSigner {
+            certificate: &state.issuer_pki.mdoc_signer,
+            allocate_status: &allocate_mdoc_status,
+        }),
     };
 
     match credential::process_credential_request(
@@ -551,13 +569,38 @@ async fn credential_endpoint(
     }
 }
 
+/// Query parameters of `GET /credential_offer`.
+#[derive(Deserialize)]
+struct OfferQuery {
+    /// The configuration to offer. The SD-JWT VC when absent.
+    credential_configuration_id: Option<String>,
+}
+
 /// `GET /credential_offer` — Generate a credential offer.
 ///
 /// Returns a credential offer with a pre-authorized code grant, plus the
 /// `openid-credential-offer://` URI a wallet would scan.
-async fn credential_offer_endpoint(State(state): State<Arc<AppState>>) -> Response {
+/// `?credential_configuration_id=mDL_mso_mdoc` offers the mDL instead.
+async fn credential_offer_endpoint(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OfferQuery>,
+) -> Response {
+    let config_id = query
+        .credential_configuration_id
+        .unwrap_or_else(|| "IdentityCredential_SD_JWT_VC".to_string());
+    if !state
+        .metadata
+        .credential_configurations_supported
+        .contains_key(&config_id)
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("unknown credential configuration: {config_id}"),
+        );
+    }
     let params = OfferParams {
-        credential_configuration_ids: vec!["IdentityCredential_SD_JWT_VC".to_string()],
+        credential_configuration_ids: vec![config_id],
         use_authorization_code: true,
         use_pre_authorized_code: true,
         require_tx_code: false,

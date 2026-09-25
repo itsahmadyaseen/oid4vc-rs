@@ -42,6 +42,8 @@ pub const ENDPOINTS: &[(&str, &str)] = &[
     ("POST", "/verifier/response"),
     ("GET", "/status/{id}"),
     ("GET", "/status/{id}/token"),
+    ("GET", "/status/mdoc"),
+    ("GET", "/iaca.crl"),
     ("POST", "/admin/status/revoke"),
     ("POST", "/admin/status/suspend"),
     ("POST", "/admin/status/reinstate"),
