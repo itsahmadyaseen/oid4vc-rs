@@ -70,7 +70,7 @@ pub struct ClientMetadata {
 /// VP formats supported by the verifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VpFormatsSupported {
-    #[serde(rename = "vc+sd-jwt", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "dc+sd-jwt", skip_serializing_if = "Option::is_none")]
     pub sd_jwt_vc: Option<FormatAlgorithms>,
 
     #[serde(rename = "mso_mdoc", skip_serializing_if = "Option::is_none")]
@@ -104,7 +104,7 @@ pub struct CredentialQuery {
     /// Unique identifier for this credential query.
     pub id: String,
 
-    /// The credential format (e.g., `vc+sd-jwt`, `mso_mdoc`).
+    /// The credential format (e.g., `dc+sd-jwt`, `mso_mdoc`).
     pub format: String,
 
     /// For SD-JWT VC: the Verifiable Credential Type.
@@ -218,7 +218,7 @@ mod tests {
         let query = DcqlQuery {
             credentials: vec![CredentialQuery {
                 id: "identity_credential".to_string(),
-                format: "vc+sd-jwt".to_string(),
+                format: "dc+sd-jwt".to_string(),
                 vct: Some("https://example.com/credentials/identity".to_string()),
                 doctype: None,
                 claims: Some(vec![
@@ -257,7 +257,7 @@ mod tests {
             dcql_query: Some(DcqlQuery {
                 credentials: vec![CredentialQuery {
                     id: "pid".to_string(),
-                    format: "vc+sd-jwt".to_string(),
+                    format: "dc+sd-jwt".to_string(),
                     vct: Some("urn:eu.europa.ec.eudi:pid:1".to_string()),
                     doctype: None,
                     claims: None,

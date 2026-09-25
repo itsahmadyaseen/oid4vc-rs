@@ -28,6 +28,17 @@ pub fn router() -> Router<Arc<AppState>> {
             get(authorization_server_metadata),
         )
         .route("/.well-known/jwks.json", get(jwks))
+        .route(metadata::IDENTITY_VCT_PATH, get(identity_type_metadata))
+}
+
+/// `GET /credentials/identity` — SD-JWT VC Type Metadata for the identity
+/// credential, resolvable from its `vct` (SD-JWT VC §6.3.1).
+async fn identity_type_metadata(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let config = MetadataConfig {
+        issuer_url: state.external_url.clone(),
+        issuer_name: String::new(),
+    };
+    Json(metadata::build_identity_type_metadata(&config))
 }
 
 /// `GET /.well-known/openid-credential-issuer`

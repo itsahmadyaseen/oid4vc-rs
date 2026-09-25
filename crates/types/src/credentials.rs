@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum CredentialFormat {
     /// SD-JWT VC (Selective Disclosure JWT Verifiable Credential).
-    /// Format identifier: `vc+sd-jwt`
-    #[serde(rename = "vc+sd-jwt")]
+    /// Format identifier: `dc+sd-jwt`
+    #[serde(rename = "dc+sd-jwt")]
     SdJwtVc,
 
     /// ISO 18013-5 mdoc (Mobile Document).
@@ -26,7 +26,7 @@ impl CredentialFormat {
     /// Returns the OID4VCI format identifier string.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::SdJwtVc => "vc+sd-jwt",
+            Self::SdJwtVc => "dc+sd-jwt",
             Self::Mdoc => "mso_mdoc",
             Self::JwtVc => "jwt_vc_json",
         }
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_credential_format_display() {
-        assert_eq!(CredentialFormat::SdJwtVc.as_str(), "vc+sd-jwt");
+        assert_eq!(CredentialFormat::SdJwtVc.as_str(), "dc+sd-jwt");
         assert_eq!(CredentialFormat::Mdoc.as_str(), "mso_mdoc");
         assert_eq!(CredentialFormat::JwtVc.as_str(), "jwt_vc_json");
     }
@@ -273,7 +273,7 @@ mod tests {
     fn test_credential_format_serde() {
         let format = CredentialFormat::SdJwtVc;
         let json = serde_json::to_string(&format).unwrap();
-        assert_eq!(json, "\"vc+sd-jwt\"");
+        assert_eq!(json, "\"dc+sd-jwt\"");
 
         let deserialized: CredentialFormat = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, CredentialFormat::SdJwtVc);

@@ -9,6 +9,19 @@ use std::sync::Mutex;
 
 use crate::authorization::AuthorizationSession;
 
+/// What an access token is allowed to obtain at the credential endpoint.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccessGrant {
+    /// Credential configurations the token was authorized for.
+    pub credential_configuration_ids: Vec<String>,
+    /// `credential_identifier` → configuration ID, when the client used
+    /// `authorization_details`. Empty for scope-based and pre-authorized grants.
+    pub credential_identifiers: HashMap<String, String>,
+    /// JWK thumbprint of the DPoP key the token is bound to. `None` means a
+    /// plain bearer token.
+    pub dpop_jkt: Option<String>,
+}
+
 /// Errors from state operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -44,25 +57,52 @@ pub trait IssuerState: Send + Sync {
 
     fn consume_authorization_code(&self, code: &str) -> Result<(), StateError>;
 
+    /// Record the access token minted from a code, so it can be revoked if the
+    /// code is replayed (RFC 6749 §4.1.2).
+    fn record_token_for_code(&self, code: &str, access_token: &str) -> Result<(), StateError>;
+
+    /// Revoke whatever access token was minted from `code`.
+    fn revoke_tokens_for_code(&self, code: &str) -> Result<(), StateError>;
+
     // -- Pre-authorized codes --
 
     fn store_pre_authorized_code(
         &self,
         code: &str,
         tx_code: Option<&str>,
+        credential_configuration_ids: Vec<String>,
     ) -> Result<(), StateError>;
 
-    fn validate_pre_authorized_code(&self, code: &str) -> Result<bool, StateError>;
-
-    fn validate_tx_code(&self, pre_auth_code: &str, tx_code: &str) -> Result<bool, StateError>;
+    /// Consume a pre-authorized code, checking its transaction code.
+    ///
+    /// Returns the offered configuration IDs, or `None` if the code is
+    /// unknown, already used, or the `tx_code` does not match what was bound
+    /// at offer time (including a missing `tx_code` when one was required).
+    fn redeem_pre_authorized_code(
+        &self,
+        code: &str,
+        tx_code: Option<&str>,
+    ) -> Result<Option<Vec<String>>, StateError>;
 
     // -- Access tokens --
 
     /// Store an access token that expires after `expires_in` seconds.
-    fn store_access_token(&self, token: &str, expires_in: u64) -> Result<(), StateError>;
+    fn store_access_token(
+        &self,
+        token: &str,
+        grant: AccessGrant,
+        expires_in: u64,
+    ) -> Result<(), StateError>;
 
-    /// Returns `true` only if the token is known and has not expired.
-    fn validate_access_token(&self, token: &str) -> Result<bool, StateError>;
+    /// The grant behind a token, or `None` if it is unknown or expired.
+    fn get_access_grant(&self, token: &str) -> Result<Option<AccessGrant>, StateError>;
+
+    // -- Replay protection --
+
+    /// Remember a one-time identifier (a DPoP or PoP `jti`) for `ttl` seconds.
+    ///
+    /// Returns `false` if it was already recorded and has not expired.
+    fn record_jti(&self, key: &str, ttl: u64) -> Result<bool, StateError>;
 
     // -- c_nonce management --
 
@@ -78,6 +118,7 @@ pub trait IssuerState: Send + Sync {
 
 struct PreAuthEntry {
     tx_code: Option<String>,
+    credential_configuration_ids: Vec<String>,
     consumed: bool,
 }
 
@@ -87,6 +128,7 @@ struct NonceEntry {
 }
 
 struct TokenEntry {
+    grant: AccessGrant,
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -96,6 +138,8 @@ pub struct InMemoryIssuerState {
     code_to_uri: Mutex<HashMap<String, String>>,
     pre_auth_codes: Mutex<HashMap<String, PreAuthEntry>>,
     access_tokens: Mutex<HashMap<String, TokenEntry>>,
+    tokens_by_code: Mutex<HashMap<String, String>>,
+    seen_jtis: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     c_nonces: Mutex<HashMap<String, NonceEntry>>,
 }
 
@@ -106,6 +150,8 @@ impl InMemoryIssuerState {
             code_to_uri: Mutex::new(HashMap::new()),
             pre_auth_codes: Mutex::new(HashMap::new()),
             access_tokens: Mutex::new(HashMap::new()),
+            tokens_by_code: Mutex::new(HashMap::new()),
+            seen_jtis: Mutex::new(HashMap::new()),
             c_nonces: Mutex::new(HashMap::new()),
         }
     }
@@ -140,6 +186,7 @@ impl IssuerState for InMemoryIssuerState {
         let mut sessions = self.sessions.lock().map_err(|_| StateError::LockPoisoned)?;
         if let Some(session) = sessions.get_mut(request_uri) {
             session.authorization_code = Some(code.to_string());
+            session.code_issued_at = Some(chrono::Utc::now());
             let mut code_map = self
                 .code_to_uri
                 .lock()
@@ -178,10 +225,49 @@ impl IssuerState for InMemoryIssuerState {
         Ok(())
     }
 
+    fn record_token_for_code(&self, code: &str, access_token: &str) -> Result<(), StateError> {
+        let mut map = self
+            .tokens_by_code
+            .lock()
+            .map_err(|_| StateError::LockPoisoned)?;
+        map.insert(code.to_string(), access_token.to_string());
+        Ok(())
+    }
+
+    fn revoke_tokens_for_code(&self, code: &str) -> Result<(), StateError> {
+        let token = self
+            .tokens_by_code
+            .lock()
+            .map_err(|_| StateError::LockPoisoned)?
+            .remove(code);
+        if let Some(token) = token {
+            self.access_tokens
+                .lock()
+                .map_err(|_| StateError::LockPoisoned)?
+                .remove(&token);
+        }
+        Ok(())
+    }
+
+    fn record_jti(&self, key: &str, ttl: u64) -> Result<bool, StateError> {
+        let mut seen = self
+            .seen_jtis
+            .lock()
+            .map_err(|_| StateError::LockPoisoned)?;
+        let now = chrono::Utc::now();
+        seen.retain(|_, expires| *expires > now);
+        if seen.contains_key(key) {
+            return Ok(false);
+        }
+        seen.insert(key.to_string(), now + chrono::Duration::seconds(ttl as i64));
+        Ok(true)
+    }
+
     fn store_pre_authorized_code(
         &self,
         code: &str,
         tx_code: Option<&str>,
+        credential_configuration_ids: Vec<String>,
     ) -> Result<(), StateError> {
         let mut codes = self
             .pre_auth_codes
@@ -191,41 +277,38 @@ impl IssuerState for InMemoryIssuerState {
             code.to_string(),
             PreAuthEntry {
                 tx_code: tx_code.map(|s| s.to_string()),
+                credential_configuration_ids,
                 consumed: false,
             },
         );
         Ok(())
     }
 
-    fn validate_pre_authorized_code(&self, code: &str) -> Result<bool, StateError> {
+    fn redeem_pre_authorized_code(
+        &self,
+        code: &str,
+        tx_code: Option<&str>,
+    ) -> Result<Option<Vec<String>>, StateError> {
         let mut codes = self
             .pre_auth_codes
             .lock()
             .map_err(|_| StateError::LockPoisoned)?;
-        if let Some(entry) = codes.get_mut(code) {
-            if entry.consumed {
-                return Ok(false);
-            }
-            entry.consumed = true;
-            Ok(true)
-        } else {
-            Ok(false)
+        let Some(entry) = codes.get_mut(code) else {
+            return Ok(None);
+        };
+        if entry.consumed || entry.tx_code.as_deref() != tx_code {
+            return Ok(None);
         }
+        entry.consumed = true;
+        Ok(Some(entry.credential_configuration_ids.clone()))
     }
 
-    fn validate_tx_code(&self, pre_auth_code: &str, tx_code: &str) -> Result<bool, StateError> {
-        let codes = self
-            .pre_auth_codes
-            .lock()
-            .map_err(|_| StateError::LockPoisoned)?;
-        if let Some(entry) = codes.get(pre_auth_code) {
-            Ok(entry.tx_code.as_deref() == Some(tx_code))
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn store_access_token(&self, token: &str, expires_in: u64) -> Result<(), StateError> {
+    fn store_access_token(
+        &self,
+        token: &str,
+        grant: AccessGrant,
+        expires_in: u64,
+    ) -> Result<(), StateError> {
         let mut tokens = self
             .access_tokens
             .lock()
@@ -233,25 +316,26 @@ impl IssuerState for InMemoryIssuerState {
         tokens.insert(
             token.to_string(),
             TokenEntry {
+                grant,
                 expires_at: chrono::Utc::now() + chrono::Duration::seconds(expires_in as i64),
             },
         );
         Ok(())
     }
 
-    fn validate_access_token(&self, token: &str) -> Result<bool, StateError> {
+    fn get_access_grant(&self, token: &str) -> Result<Option<AccessGrant>, StateError> {
         let mut tokens = self
             .access_tokens
             .lock()
             .map_err(|_| StateError::LockPoisoned)?;
         match tokens.get(token) {
-            Some(entry) if chrono::Utc::now() < entry.expires_at => Ok(true),
+            Some(entry) if chrono::Utc::now() < entry.expires_at => Ok(Some(entry.grant.clone())),
             Some(_) => {
                 // Expired: drop it so the map does not grow without bound.
                 tokens.remove(token);
-                Ok(false)
+                Ok(None)
             }
-            None => Ok(false),
+            None => Ok(None),
         }
     }
 
@@ -290,17 +374,21 @@ mod tests {
     fn test_in_memory_access_tokens() {
         let state = InMemoryIssuerState::new();
 
-        state.store_access_token("token-1", 3600).unwrap();
-        assert!(state.validate_access_token("token-1").unwrap());
-        assert!(!state.validate_access_token("token-2").unwrap());
+        state
+            .store_access_token("token-1", AccessGrant::default(), 3600)
+            .unwrap();
+        assert!(state.get_access_grant("token-1").unwrap().is_some());
+        assert!(state.get_access_grant("token-2").unwrap().is_none());
     }
 
     #[test]
     fn test_expired_access_token_is_rejected() {
         let state = InMemoryIssuerState::new();
 
-        state.store_access_token("token-1", 0).unwrap();
-        assert!(!state.validate_access_token("token-1").unwrap());
+        state
+            .store_access_token("token-1", AccessGrant::default(), 0)
+            .unwrap();
+        assert!(state.get_access_grant("token-1").unwrap().is_none());
     }
 
     #[test]
@@ -319,17 +407,32 @@ mod tests {
     #[test]
     fn test_in_memory_pre_authorized_code() {
         let state = InMemoryIssuerState::new();
+        let ids = vec!["cfg".to_string()];
 
         state
-            .store_pre_authorized_code("code-1", Some("123456"))
+            .store_pre_authorized_code("code-1", Some("123456"), ids.clone())
             .unwrap();
 
-        assert!(state.validate_tx_code("code-1", "123456").unwrap());
-        assert!(!state.validate_tx_code("code-1", "000000").unwrap());
+        // A wrong or missing tx_code does not consume the code.
+        assert!(state
+            .redeem_pre_authorized_code("code-1", Some("000000"))
+            .unwrap()
+            .is_none());
+        assert!(state
+            .redeem_pre_authorized_code("code-1", None)
+            .unwrap()
+            .is_none());
 
-        // First validation consumes the code
-        assert!(state.validate_pre_authorized_code("code-1").unwrap());
-        // Second attempt fails
-        assert!(!state.validate_pre_authorized_code("code-1").unwrap());
+        // The right one does, exactly once.
+        assert_eq!(
+            state
+                .redeem_pre_authorized_code("code-1", Some("123456"))
+                .unwrap(),
+            Some(ids)
+        );
+        assert!(state
+            .redeem_pre_authorized_code("code-1", Some("123456"))
+            .unwrap()
+            .is_none());
     }
 }

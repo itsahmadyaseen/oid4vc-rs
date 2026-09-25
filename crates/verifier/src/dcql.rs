@@ -28,7 +28,7 @@ impl DcqlQueryBuilder {
 
         self.credentials.push(CredentialQuery {
             id: id.to_string(),
-            format: "vc+sd-jwt".to_string(),
+            format: "dc+sd-jwt".to_string(),
             vct: Some(vct.to_string()),
             doctype: None,
             claims: if claim_queries.is_empty() {
@@ -142,7 +142,7 @@ mod tests {
             .build();
 
         assert_eq!(query.credentials.len(), 1);
-        assert_eq!(query.credentials[0].format, "vc+sd-jwt");
+        assert_eq!(query.credentials[0].format, "dc+sd-jwt");
         assert_eq!(query.credentials[0].claims.as_ref().unwrap().len(), 3);
     }
 
@@ -165,7 +165,7 @@ mod tests {
     fn test_evaluate_credential_query_satisfied() {
         let query = CredentialQuery {
             id: "test".to_string(),
-            format: "vc+sd-jwt".to_string(),
+            format: "dc+sd-jwt".to_string(),
             vct: None,
             doctype: None,
             claims: Some(vec![ClaimQuery {
@@ -189,7 +189,7 @@ mod tests {
     fn test_evaluate_credential_query_not_satisfied() {
         let query = CredentialQuery {
             id: "test".to_string(),
-            format: "vc+sd-jwt".to_string(),
+            format: "dc+sd-jwt".to_string(),
             vct: None,
             doctype: None,
             claims: Some(vec![

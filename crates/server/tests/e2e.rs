@@ -12,6 +12,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use oid4vc_crypto::keys::{EcdsaP256KeyPair, KeyPair};
+use oid4vc_issuer::state::IssuerState;
 use oid4vc_server::{build_router, AppState, ServerConfig, ENDPOINTS};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -27,12 +28,192 @@ fn test_app() -> (Router, Arc<AppState>) {
         admin_token: Some(ADMIN_TOKEN.to_string()),
         ..ServerConfig::default()
     };
-    let state = Arc::new(AppState::new(&config).expect("app state builds"));
+    let mut state = AppState::new(&config).expect("app state builds");
+    state.client_attesters = vec![attester().public_jwk()];
+    let state = Arc::new(state);
     (build_router(state.clone()), state)
+}
+
+/// The client attester every test app trusts.
+fn attester() -> &'static EcdsaP256KeyPair {
+    static ATTESTER: std::sync::OnceLock<EcdsaP256KeyPair> = std::sync::OnceLock::new();
+    ATTESTER.get_or_init(|| EcdsaP256KeyPair::generate().unwrap())
+}
+
+const ISSUER: &str = "http://localhost:3000";
+
+/// A HAIP wallet: attested by [`attester`], and holding a DPoP key.
+struct HaipWallet {
+    client_id: String,
+    instance: EcdsaP256KeyPair,
+    dpop: EcdsaP256KeyPair,
+}
+
+impl HaipWallet {
+    fn new(client_id: &str) -> Self {
+        Self {
+            client_id: client_id.to_string(),
+            instance: EcdsaP256KeyPair::generate().unwrap(),
+            dpop: EcdsaP256KeyPair::generate().unwrap(),
+        }
+    }
+
+    /// `OAuth-Client-Attestation` and `-PoP` headers for one request.
+    fn attestation_headers(&self) -> [(&'static str, String); 2] {
+        let now = chrono::Utc::now().timestamp();
+        let attestation = oid4vc_crypto::jws::sign_compact(
+            attester(),
+            &oid4vc_crypto::jws::build_header(attester(), Some("oauth-client-attestation+jwt")),
+            &serde_json::json!({
+                "iss": "https://attester.example.com",
+                "sub": self.client_id,
+                "iat": now,
+                "exp": now + 300,
+                "cnf": { "jwk": self.instance.public_jwk() },
+            }),
+        )
+        .unwrap();
+        let pop = oid4vc_crypto::jws::sign_compact(
+            &self.instance,
+            &oid4vc_crypto::jws::build_header(
+                &self.instance,
+                Some("oauth-client-attestation-pop+jwt"),
+            ),
+            &serde_json::json!({
+                "iss": self.client_id,
+                "aud": ISSUER,
+                "iat": now,
+                "jti": uuid::Uuid::new_v4().to_string(),
+            }),
+        )
+        .unwrap();
+        [
+            ("oauth-client-attestation", attestation),
+            ("oauth-client-attestation-pop", pop),
+        ]
+    }
+
+    /// A DPoP proof for `POST {path}`, bound to `access_token` when given.
+    fn dpop_proof(&self, path: &str, access_token: Option<&str>) -> String {
+        use base64ct::Encoding;
+        use sha2::Digest;
+        let mut claims = serde_json::json!({
+            "htm": "POST",
+            "htu": format!("{ISSUER}{path}"),
+            "iat": chrono::Utc::now().timestamp(),
+            "jti": uuid::Uuid::new_v4().to_string(),
+        });
+        if let Some(token) = access_token {
+            claims["ath"] =
+                base64ct::Base64UrlUnpadded::encode_string(&sha2::Sha256::digest(token.as_bytes()))
+                    .into();
+        }
+        let header = oid4vc_crypto::jws::build_header_with_jwk(&self.dpop, Some("dpop+jwt"));
+        oid4vc_crypto::jws::sign_compact(&self.dpop, &header, &claims).unwrap()
+    }
+
+    /// POST a form with client attestation and a DPoP proof.
+    async fn post_authenticated(&self, app: &Router, path: &str, form: &str) -> Res {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("dpop", self.dpop_proof(path, None));
+        for (name, value) in self.attestation_headers() {
+            builder = builder.header(name, value);
+        }
+        send(app, builder.body(Body::from(form.to_string())).unwrap()).await
+    }
+
+    /// Call the credential endpoint with the DPoP scheme and a bound proof.
+    async fn request_credential(&self, app: &Router, access_token: &str, body: Value) -> Res {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/credential")
+            .header("content-type", "application/json")
+            .header("authorization", format!("DPoP {access_token}"))
+            .header("dpop", self.dpop_proof("/credential", Some(access_token)))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        send(app, request).await
+    }
+}
+
+const REDIRECT_URI: &str = "https://wallet.example.com/cb";
+const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+/// PAR, then the consent page, then the user's `decision`. Returns the
+/// redirect back to the wallet.
+async fn authorize(app: &Router, wallet: &HaipWallet, decision: &str) -> url::Url {
+    let challenge = {
+        use base64ct::Encoding;
+        use sha2::Digest;
+        base64ct::Base64UrlUnpadded::encode_string(&sha2::Sha256::digest(PKCE_VERIFIER.as_bytes()))
+    };
+    // Form-encoded, with authorization_details as a JSON string, the way the
+    // conformance suite sends it.
+    let details = r#"[{"type":"openid_credential","credential_configuration_id":"IdentityCredential_SD_JWT_VC"}]"#;
+    let par = wallet
+        .post_authenticated(
+            app,
+            "/authorize/par",
+            &format!(
+                "response_type=code&client_id={}&redirect_uri={}&state=wallet-state-1\
+                 &code_challenge={challenge}&code_challenge_method=S256&authorization_details={}",
+                enc(&wallet.client_id),
+                enc(REDIRECT_URI),
+                enc(details),
+            ),
+        )
+        .await;
+    assert_eq!(par.status, StatusCode::CREATED, "{}", par.body);
+    let request_uri = par.json()["request_uri"].as_str().unwrap().to_string();
+
+    let consent = get(
+        app,
+        &format!(
+            "/authorize?client_id={}&request_uri={}",
+            enc(&wallet.client_id),
+            enc(&request_uri)
+        ),
+    )
+    .await;
+    assert_eq!(consent.status, StatusCode::OK, "{}", consent.body);
+    assert!(consent.body.contains(r#"id="approve""#));
+
+    let decided = post_form(
+        app,
+        "/authorize/decision",
+        &format!(
+            "request_uri={}&client_id={}&decision={decision}",
+            enc(&request_uri),
+            enc(&wallet.client_id)
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(decided.status, StatusCode::SEE_OTHER, "{}", decided.body);
+    url::Url::parse(decided.headers["location"].to_str().unwrap()).unwrap()
+}
+
+fn query_param(url: &url::Url, name: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.into_owned())
+}
+
+fn redeem_form(code: &str) -> String {
+    format!(
+        "grant_type=authorization_code&code={}&code_verifier={}&redirect_uri={}",
+        enc(code),
+        enc(PKCE_VERIFIER),
+        enc(REDIRECT_URI)
+    )
 }
 
 struct Res {
     status: StatusCode,
+    headers: axum::http::HeaderMap,
     body: String,
 }
 
@@ -46,6 +227,7 @@ impl Res {
 async fn send(app: &Router, request: Request<Body>) -> Res {
     let response = app.clone().oneshot(request).await.expect("router responds");
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = response
         .into_body()
         .collect()
@@ -54,6 +236,7 @@ async fn send(app: &Router, request: Request<Body>) -> Res {
         .to_bytes();
     Res {
         status,
+        headers,
         body: String::from_utf8_lossy(&bytes).to_string(),
     }
 }
@@ -128,7 +311,7 @@ async fn obtain_credential(app: &Router) -> (String, EcdsaP256KeyPair) {
     let token = token.json();
 
     let access_token = token["access_token"].as_str().unwrap().to_string();
-    let c_nonce = token["c_nonce"].as_str().unwrap().to_string();
+    let c_nonce = fetch_nonce(app).await;
 
     let issuer_id = get(app, "/.well-known/openid-credential-issuer")
         .await
@@ -145,8 +328,8 @@ async fn obtain_credential(app: &Router) -> (String, EcdsaP256KeyPair) {
         app,
         "/credential",
         serde_json::json!({
-            "format": "vc+sd-jwt",
-            "proof": { "proof_type": "jwt", "jwt": proof },
+            "credential_configuration_id": "IdentityCredential_SD_JWT_VC",
+            "proofs": { "jwt": [proof] },
         }),
         Some(&access_token),
     )
@@ -158,11 +341,26 @@ async fn obtain_credential(app: &Router) -> (String, EcdsaP256KeyPair) {
         credential.body
     );
 
-    let sd_jwt = credential.json()["credential"]
+    let sd_jwt = credential.json()["credentials"][0]["credential"]
         .as_str()
         .unwrap()
         .to_string();
     (sd_jwt, holder)
+}
+
+/// Fetch a fresh `c_nonce` from the Nonce Endpoint, as a 1.0 wallet does.
+async fn fetch_nonce(app: &Router) -> String {
+    let res = send(
+        app,
+        Request::builder()
+            .method("POST")
+            .uri("/nonce")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "nonce: {}", res.body);
+    res.json()["c_nonce"].as_str().unwrap().to_string()
 }
 
 /// Turn an issued credential into a presentation bound to a nonce and audience.
@@ -276,7 +474,14 @@ async fn pre_authorized_code_flow_issues_a_bound_credential() {
     let status_uri = verified.payload["status"]["status_list"]["uri"]
         .as_str()
         .expect("credential must carry a status list reference");
-    assert!(status_uri.ends_with("/status/revocation"));
+    assert!(status_uri.ends_with("/status/revocation/token"));
+
+    // HAIP: the credential carries the issuer certificate, leaf only.
+    let header = oid4vc_crypto::jws::decode_compact(sd_jwt.split('~').next().unwrap())
+        .unwrap()
+        .header;
+    assert_eq!(header.typ.as_deref(), Some("dc+sd-jwt"));
+    assert_eq!(header.x5c, Some(state.issuer_certificate.x5c()));
 
     assert_eq!(verified.claims["given_name"], "John");
     assert_eq!(verified.claims["family_name"], "Doe");
@@ -311,94 +516,185 @@ async fn token_endpoint_accepts_form_encoding() {
     assert_eq!(res.json()["token_type"], "Bearer");
 }
 
+/// The HAIP flow the conformance suite drives: attested client, PAR with
+/// DPoP, consent, DPoP-bound token, `credential_identifier`, DPoP resource call.
 #[tokio::test]
-async fn authorization_code_flow_reaches_a_token() {
+async fn haip_authorization_code_flow_issues_a_credential() {
     let (app, _state) = test_app();
+    let wallet = HaipWallet::new("wallet-1");
 
-    // PKCE
-    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-    let challenge = {
-        use base64ct::Encoding;
-        use sha2::Digest;
-        base64ct::Base64UrlUnpadded::encode_string(&sha2::Sha256::digest(verifier.as_bytes()))
+    let redirect = authorize(&app, &wallet, "approve").await;
+    assert_eq!(
+        query_param(&redirect, "state").as_deref(),
+        Some("wallet-state-1")
+    );
+    assert_eq!(
+        query_param(&redirect, "iss").as_deref(),
+        Some(ISSUER),
+        "RFC 9207: the redirect must identify the issuer"
+    );
+    let code = query_param(&redirect, "code").expect("redirect carries a code");
+
+    let token = wallet
+        .post_authenticated(&app, "/token", &redeem_form(&code))
+        .await;
+    assert_eq!(token.status, StatusCode::OK, "{}", token.body);
+    let token = token.json();
+    assert_eq!(token["token_type"], "DPoP");
+    let access_token = token["access_token"].as_str().unwrap().to_string();
+    let identifier = token["authorization_details"][0]["credential_identifiers"][0]
+        .as_str()
+        .expect("RAR requests get credential_identifiers back")
+        .to_string();
+
+    let holder = EcdsaP256KeyPair::generate().unwrap();
+    let body = |nonce: String| {
+        serde_json::json!({
+            "credential_identifier": identifier,
+            "proofs": { "jwt": [wallet_proof(&holder, &nonce, ISSUER)] },
+        })
     };
 
-    let par = post_json(
+    // A DPoP-bound token presented as a bearer token is refused.
+    let as_bearer = post_json(
         &app,
-        "/authorize/par",
-        serde_json::json!({
-            "response_type": "code",
-            "client_id": "test-wallet",
-            "redirect_uri": "https://wallet.example.com/cb",
-            "scope": null,
-            "state": "wallet-state-1",
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        }),
-        None,
-    )
-    .await;
-    assert_eq!(par.status, StatusCode::CREATED, "{}", par.body);
-    let request_uri = par.json()["request_uri"].as_str().unwrap().to_string();
-
-    // The authorization endpoint must exist, or PAR is a dead end.
-    let authorize = get(
-        &app,
-        &format!("/authorize?request_uri={}", enc(&request_uri)),
+        "/credential",
+        body(fetch_nonce(&app).await),
+        Some(&access_token),
     )
     .await;
     assert_eq!(
-        authorize.status,
-        StatusCode::SEE_OTHER,
-        "expected a redirect carrying the code: {}",
-        authorize.body
+        as_bearer.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        as_bearer.body
     );
+    assert!(as_bearer.headers.contains_key("www-authenticate"));
 
-    let location = {
-        let (app2, _s) = (app.clone(), ());
-        let response = app2
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/authorize?request_uri={}", enc(&request_uri)))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        response
-            .headers()
-            .get("location")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string()
-    };
+    // A proof from another key is refused too.
+    let thief = HaipWallet::new("wallet-1");
+    let stolen = thief
+        .request_credential(&app, &access_token, body(fetch_nonce(&app).await))
+        .await;
+    assert_eq!(stolen.status, StatusCode::UNAUTHORIZED, "{}", stolen.body);
 
-    let redirect = url::Url::parse(&location).unwrap();
-    let code = redirect
-        .query_pairs()
-        .find(|(k, _)| k == "code")
-        .map(|(_, v)| v.to_string())
-        .expect("redirect carries an authorization code");
-    let echoed_state = redirect
-        .query_pairs()
-        .find(|(k, _)| k == "state")
-        .map(|(_, v)| v.to_string());
-    assert_eq!(echoed_state.as_deref(), Some("wallet-state-1"));
+    let issued = wallet
+        .request_credential(&app, &access_token, body(fetch_nonce(&app).await))
+        .await;
+    assert_eq!(issued.status, StatusCode::OK, "{}", issued.body);
+    assert!(issued.json()["credentials"][0]["credential"].is_string());
+}
 
-    let token = post_form(
+#[tokio::test]
+async fn par_requires_client_attestation() {
+    let (app, _state) = test_app();
+    let res = post_form(
         &app,
-        "/token",
-        &format!(
-            "grant_type=authorization_code&code={}&code_verifier={}",
-            enc(&code),
-            enc(verifier)
-        ),
+        "/authorize/par",
+        "response_type=code&client_id=wallet-1&redirect_uri=https%3A%2F%2Fw.example%2Fcb\
+         &code_challenge=abc&code_challenge_method=S256&scope=identity_credential",
         None,
     )
     .await;
-    assert_eq!(token.status, StatusCode::OK, "{}", token.body);
-    assert!(token.json()["access_token"].as_str().is_some());
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(res.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn user_can_deny_consent() {
+    let (app, _state) = test_app();
+    let redirect = authorize(&app, &HaipWallet::new("wallet-1"), "deny").await;
+    assert_eq!(
+        query_param(&redirect, "error").as_deref(),
+        Some("access_denied")
+    );
+    assert_eq!(
+        query_param(&redirect, "state").as_deref(),
+        Some("wallet-state-1")
+    );
+    assert!(query_param(&redirect, "code").is_none());
+}
+
+#[tokio::test]
+async fn authorization_code_is_bound_to_its_client() {
+    let (app, _state) = test_app();
+    let wallet = HaipWallet::new("wallet-1");
+    let code = query_param(&authorize(&app, &wallet, "approve").await, "code").unwrap();
+
+    let other = HaipWallet::new("wallet-2");
+    let res = other
+        .post_authenticated(&app, "/token", &redeem_form(&code))
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert_eq!(res.json()["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn replaying_a_code_revokes_the_token_it_minted() {
+    let (app, state) = test_app();
+    let wallet = HaipWallet::new("wallet-1");
+    let code = query_param(&authorize(&app, &wallet, "approve").await, "code").unwrap();
+
+    let first = wallet
+        .post_authenticated(&app, "/token", &redeem_form(&code))
+        .await
+        .json();
+    let access_token = first["access_token"].as_str().unwrap();
+    assert!(state
+        .issuer_state
+        .get_access_grant(access_token)
+        .unwrap()
+        .is_some());
+
+    let replay = wallet
+        .post_authenticated(&app, "/token", &redeem_form(&code))
+        .await;
+    assert_eq!(replay.json()["error"], "invalid_grant");
+    assert!(
+        state
+            .issuer_state
+            .get_access_grant(access_token)
+            .unwrap()
+            .is_none(),
+        "the token from the first redemption must be revoked"
+    );
+}
+
+#[tokio::test]
+async fn authorization_code_grant_requires_dpop() {
+    let (app, _state) = test_app();
+    let wallet = HaipWallet::new("wallet-1");
+    let code = query_param(&authorize(&app, &wallet, "approve").await, "code").unwrap();
+
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/token")
+        .header("content-type", "application/x-www-form-urlencoded");
+    for (name, value) in wallet.attestation_headers() {
+        builder = builder.header(name, value);
+    }
+    let res = send(&app, builder.body(Body::from(redeem_form(&code))).unwrap()).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+}
+
+#[tokio::test]
+async fn nonce_endpoint_is_uncacheable_and_single_use() {
+    let (app, state) = test_app();
+    let res = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/nonce")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.headers.get("cache-control").unwrap(), "no-store");
+
+    let nonce = res.json()["c_nonce"].as_str().unwrap().to_string();
+    assert!(state.issuer_state.consume_c_nonce(&nonce).unwrap());
+    assert!(!state.issuer_state.consume_c_nonce(&nonce).unwrap());
 }
 
 #[tokio::test]
@@ -425,7 +721,7 @@ async fn credential_endpoint_rejects_an_unsigned_proof() {
     .await
     .json();
     let access_token = token["access_token"].as_str().unwrap().to_string();
-    let c_nonce = token["c_nonce"].as_str().unwrap().to_string();
+    let c_nonce = fetch_nonce(&app).await;
 
     // A proof whose header names one key but whose signature comes from another.
     let real_holder = EcdsaP256KeyPair::generate().unwrap();
@@ -443,8 +739,8 @@ async fn credential_endpoint_rejects_an_unsigned_proof() {
         &app,
         "/credential",
         serde_json::json!({
-            "format": "vc+sd-jwt",
-            "proof": { "proof_type": "jwt", "jwt": forged },
+            "credential_configuration_id": "IdentityCredential_SD_JWT_VC",
+            "proofs": { "jwt": [forged] },
         }),
         Some(&access_token),
     )
@@ -461,7 +757,7 @@ async fn credential_endpoint_rejects_a_missing_token() {
     let res = post_json(
         &app,
         "/credential",
-        serde_json::json!({ "format": "vc+sd-jwt" }),
+        serde_json::json!({ "credential_configuration_id": "IdentityCredential_SD_JWT_VC" }),
         None,
     )
     .await;
@@ -619,15 +915,32 @@ async fn a_presentation_cannot_be_replayed() {
 
 #[tokio::test]
 async fn status_endpoints_publish_both_formats() {
-    let (app, _state) = test_app();
+    let (app, state) = test_app();
 
     let sl2021 = get(&app, "/status/revocation").await;
     assert_eq!(sl2021.status, StatusCode::OK);
     assert_eq!(sl2021.json()["credentialSubject"]["type"], "StatusList2021");
 
+    // The Status List Token is a signed JWT, not JSON.
     let tsl = get(&app, "/status/revocation/token").await;
     assert_eq!(tsl.status, StatusCode::OK);
-    assert_eq!(tsl.json()["status_list"]["bits"], 2);
+    assert_eq!(
+        tsl.headers.get("content-type").unwrap(),
+        "application/statuslist+jwt"
+    );
+    let decoded = oid4vc_crypto::jws::verify_compact(&tsl.body, state.primary_key.as_ref())
+        .expect("status list token is signed by the issuer");
+    assert_eq!(decoded.header.typ.as_deref(), Some("statuslist+jwt"));
+    assert!(decoded.header.x5c.is_some());
+    let claims: Value = serde_json::from_slice(&decoded.payload).unwrap();
+    assert_eq!(claims["status_list"]["bits"], 2);
+    assert!(
+        claims["sub"]
+            .as_str()
+            .unwrap()
+            .ends_with("/status/revocation/token"),
+        "sub must equal the URI credentials reference"
+    );
 
     assert_eq!(
         get(&app, "/status/nonexistent").await.status,

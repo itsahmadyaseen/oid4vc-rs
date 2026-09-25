@@ -57,7 +57,7 @@ pub fn create_offer(issuer_url: &Url, params: &OfferParams) -> (CredentialOffer,
     }
 
     let offer = CredentialOffer {
-        credential_issuer: issuer_url.clone(),
+        credential_issuer: issuer_url.as_str().trim_end_matches('/').to_string(),
         credential_configuration_ids: params.credential_configuration_ids.clone(),
         grants: Some(grants),
     };

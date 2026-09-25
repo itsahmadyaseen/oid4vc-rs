@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -37,25 +37,43 @@ async fn get_status_list(State(state): State<Arc<AppState>>, Path(id): Path<Stri
     }
 }
 
-/// `GET /status/{id}/token` — Serve the IETF Token Status List.
+/// How long a relying party may cache a Status List Token, in seconds.
+const STATUS_LIST_TTL_SECS: i64 = 300;
+
+/// `GET /status/{id}/token` — Serve the IETF Status List Token.
 ///
-/// This is the form referenced by the `status.status_list` claim inside issued
-/// SD-JWT VCs, so a relying party can resolve a credential's status.
+/// This is what the `status.status_list.uri` claim in issued SD-JWT VCs points
+/// at. It is a signed JWT (`typ: statuslist+jwt`) whose `sub` is that same URI,
+/// carrying the issuer certificate in `x5c` as HAIP requires.
 async fn get_token_status_list(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.status_manager.build_token_status_list(&id) {
-        Ok(list) => {
-            let body = serde_json::json!({
-                "iss": state.issuer_id,
-                "sub": state.url_for(&format!("/status/{id}")).as_str(),
-                "iat": chrono::Utc::now().timestamp(),
-                "status_list": list,
-            });
-            Json(body).into_response()
-        }
-        Err(e) => json_error(StatusCode::NOT_FOUND, "not_found", &e.to_string()),
+    let list = match state.status_manager.build_token_status_list(&id) {
+        Ok(list) => list,
+        Err(e) => return json_error(StatusCode::NOT_FOUND, "not_found", &e.to_string()),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": state.issuer_id,
+        "sub": state.url_for(&format!("/status/{id}/token")).as_str(),
+        "iat": now,
+        "exp": now + 24 * 3600,
+        "ttl": STATUS_LIST_TTL_SECS,
+        "status_list": list,
+    });
+    let mut header =
+        oid4vc_crypto::jws::build_header(state.primary_key.as_ref(), Some("statuslist+jwt"));
+    header.x5c = Some(state.issuer_certificate.x5c());
+
+    match oid4vc_crypto::jws::sign_compact(state.primary_key.as_ref(), &header, &claims) {
+        Ok(jwt) => ([(header::CONTENT_TYPE, "application/statuslist+jwt")], jwt).into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &e.to_string(),
+        ),
     }
 }
 

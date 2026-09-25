@@ -28,10 +28,23 @@ impl From<Oid4vcError> for AppError {
 }
 
 /// Generic JSON error response helper.
+///
+/// `error_description` is restricted to the characters RFC 6749 §5.2 allows
+/// (printable ASCII without `"` and `\\`), so arbitrary error text is mapped
+/// into that set rather than producing a non-conformant response.
 pub fn json_error(status: StatusCode, error: &str, description: &str) -> Response {
+    let description = description
+        .chars()
+        .map(|c| match c {
+            '"' => '\'',
+            '\\' => '/',
+            ' '..='~' => c,
+            _ => '?',
+        })
+        .collect();
     let body = ErrorResponse {
         error: error.to_string(),
-        error_description: Some(description.to_string()),
+        error_description: Some(description),
         c_nonce: None,
         c_nonce_expires_in: None,
     };
