@@ -1,0 +1,13 @@
+# Overlay for the conformance suite's docker-compose-prebuilt.yml.
+#
+# Puts TLS in front of an issuer running on the host (port 3000), reachable
+# from the suite containers as https://issuer.oid4vc.test. The suite accepts
+# the proxy's internal CA.
+services:
+  issuer-tls:
+    image: caddy:2-alpine
+    command: caddy reverse-proxy --from https://issuer.oid4vc.test --to http://host.docker.internal:3000 --internal-certs
+    networks:
+      default:
+        aliases:
+          - issuer.oid4vc.test

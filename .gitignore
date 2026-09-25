@@ -38,3 +38,6 @@ job-hunt/
 # Local smoke-test output
 server.log
 server.pid
+
+# Conformance run output: generated configs hold test keys
+conformance/out/

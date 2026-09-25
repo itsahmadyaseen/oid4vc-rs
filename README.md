@@ -10,16 +10,33 @@ A Rust implementation of **OpenID for Verifiable Credential Issuance (OID4VCI 1.
 
 ## Conformance Results
 
-> **Status: not yet run against the conformance suite.**
+The issuer was run against the [OpenID Foundation conformance suite](https://gitlab.com/openid/conformance-suite)
+v5.3.1, self-hosted, on 2026-09-25. Plan: `oid4vci-1_0-issuer-haip-test-plan`,
+SD-JWT VC, 63 test modules per variant.
 
-| Test Plan | Spec Version | Profile | Date | Pass | Fail |
-|-----------|-------------|---------|------|------|------|
-| OID4VCI Issuer | 1.0 | HAIP 1.0 | *not yet run* | — | — |
-| OID4VP Verifier | 1.0 | HAIP 1.0 | *not yet run* | — | — |
+| Test Plan | Variant | Date | Passed | Review | Skipped | Failed |
+|-----------|---------|------|--------|--------|---------|--------|
+| OID4VCI 1.0 Issuer, HAIP 1.0 | wallet-initiated authorization code | 2026-09-25 | 55 | 2 | 6 | 0 |
+| OID4VCI 1.0 Issuer, HAIP 1.0 | issuer-initiated authorization code | 2026-09-25 | 55 | 2 | 6 | 0 |
+| OID4VP 1.0 Verifier, HAIP 1.0 | — | *not yet run* | — | — | — | — |
 
-This table will be filled in after running against the [OpenID Foundation conformance suite](https://www.certification.openid.net/). No conformance claim is made until then, and this implementation is **not** OpenID certified.
+- **Review** — `…-without-using-par-fails` and `…-request_uri-for-different-client`.
+  The issuer refuses these requests with an error page rather than redirecting,
+  since it cannot trust the redirect URI. The suite captures that page for a
+  human reviewer, which is the expected outcome.
+- **Skipped** — signed issuer metadata and key attestation (optional, not
+  implemented), refresh tokens (none are issued), and the three modules of the
+  encrypted variant (credential request/response encryption is not implemented).
+- Two modules need a different scripted browser, as their descriptions ask:
+  `…-user-rejects-authentication` clicks *Deny*, and
+  `…-reused-request-uri-prior-to-auth-completion-succeeds` takes no action on the
+  first visit. They were run on their own with those scripts, and both pass.
 
-What *is* verified today is the full issue → present → verify loop, end to end over the real HTTP router, in `crates/server/tests/e2e.rs`.
+These are self-run results, not an OpenID Foundation certification. The run
+harness is in [`conformance/`](conformance/), so they can be reproduced.
+
+The full issue → present → verify loop is also covered end to end over the real
+HTTP router in `crates/server/tests/e2e.rs`.
 
 ---
 
@@ -76,6 +93,10 @@ graph TB
 | OpenID4VCI | [1.0](https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html) |
 | OpenID4VP | [1.0](https://openid.net/specs/openid-4-verifiable-presentations-1_0.html) |
 | HAIP | [1.0](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0.html) |
+| FAPI 2.0 Security Profile | [Final](https://openid.net/specs/fapi-security-profile-2_0-final.html) |
+| DPoP | [RFC 9449](https://datatracker.ietf.org/doc/rfc9449/) |
+| PAR | [RFC 9126](https://datatracker.ietf.org/doc/rfc9126/) |
+| Attestation-Based Client Authentication | [draft-ietf-oauth-attestation-based-client-auth](https://datatracker.ietf.org/doc/draft-ietf-oauth-attestation-based-client-auth/) |
 | SD-JWT | [RFC 9901](https://datatracker.ietf.org/doc/rfc9901/) |
 | DCQL | OID4VP 1.0 §5.3 |
 | StatusList2021 | [W3C v1.0](https://www.w3.org/TR/vc-status-list/) |
@@ -107,17 +128,22 @@ curl http://localhost:3000/.well-known/oauth-authorization-server | jq .
 CODE=$(curl -s localhost:3000/credential_offer \
   | jq -r '.credential_offer.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"]["pre-authorized_code"]')
 
-# 2. Exchange it for an access token and c_nonce (form-encoded, per OAuth 2.0)
+# 2. Exchange it for an access token (form-encoded, per OAuth 2.0)
 curl -s -X POST localhost:3000/token \
   -H 'content-type: application/x-www-form-urlencoded' \
   --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:pre-authorized_code' \
   --data-urlencode "pre-authorized_code=$CODE" | jq .
+
+# 3. Fetch a fresh c_nonce from the Nonce Endpoint (OID4VCI §7)
+curl -s -X POST localhost:3000/nonce | jq .
 ```
 
-Step 3 — `POST /credential` — needs a signed proof-of-possession JWT, so it is
-not a one-liner in `curl`. The credential endpoint verifies that signature, so a
-hand-written proof is rejected. See `crates/server/tests/e2e.rs` for a wallet
-that does it properly.
+Step 4 — `POST /credential` with `credential_configuration_id` and
+`proofs.jwt[]` — needs a proof-of-possession JWT signed over that `c_nonce`, so
+it is not a one-liner in `curl`. The credential endpoint verifies that
+signature, so a hand-written proof is rejected. See `crates/server/tests/e2e.rs`
+for a wallet that does it properly, including the HAIP authorization code flow
+with PAR, client attestation and DPoP.
 
 ### Configuration
 
@@ -127,6 +153,9 @@ that does it properly.
 | `EXTERNAL_URL` | `http://localhost:{port}` | Credential Issuer identifier; the `aud` wallets must use |
 | `ISSUER_KEY_P256_PEM` | *(unset)* | P-256 signing key, created on first start. Unset means ephemeral keys, and credentials stop verifying after a restart |
 | `ISSUER_KEY_ED25519_PEM` | *(unset)* | Ed25519 signing key |
+| `ISSUER_CERT_PEM` | *(unset)* | X.509 certificate for the P-256 key, sent as the `x5c` header on credentials and status list tokens. If the file is missing, a development CA and leaf are minted and written here |
+| `ISSUER_TRUST_ANCHOR_PEM` | *(unset)* | Where a minted development CA certificate is written, for relying parties to trust. Unset means it is printed to the log |
+| `CLIENT_ATTESTER_JWKS` | *(unset)* | JWKS of trusted wallet attesters. The authorization code flow requires OAuth 2.0 Attestation-Based Client Authentication, so unset means every wallet is rejected there |
 | `ADMIN_API_TOKEN` | *(generated)* | Bearer token for `/admin/status/*`. A generated one is written to the log at startup |
 | `CREDENTIAL_ISSUER_NAME` | `OID4VC-RS Development Issuer` | Display name in metadata |
 
@@ -148,10 +177,13 @@ curl http://localhost:3000/.well-known/openid-credential-issuer | jq .
 | `GET` | `/.well-known/openid-credential-issuer` | Credential Issuer Metadata |
 | `GET` | `/.well-known/oauth-authorization-server` | Authorization Server Metadata (RFC 8414) |
 | `GET` | `/.well-known/jwks.json` | JSON Web Key Set |
-| `POST` | `/authorize/par` | Pushed Authorization Request |
-| `GET` | `/authorize` | Authorization endpoint — issues the code, redirects to the wallet |
-| `POST` | `/token` | Token endpoint (auth code + pre-auth code) |
-| `POST` | `/credential` | Credential endpoint (SD-JWT VC, mdoc) |
+| `GET` | `/credentials/identity` | SD-JWT VC Type Metadata, resolvable from the credential's `vct` |
+| `POST` | `/authorize/par` | Pushed Authorization Request (client attestation required) |
+| `GET` | `/authorize` | Authorization endpoint — shows the consent page for a pushed request |
+| `POST` | `/authorize/decision` | Consent decision — redirects to the wallet with a code or `access_denied` |
+| `POST` | `/token` | Token endpoint (auth code + pre-auth code), DPoP-bound tokens |
+| `POST` | `/nonce` | Nonce endpoint — a fresh single-use `c_nonce` |
+| `POST` | `/credential` | Credential endpoint (SD-JWT VC, mdoc), batch via `proofs.jwt[]` |
 | `GET` | `/credential_offer` | Generate a credential offer |
 
 The OAuth endpoints (`/authorize/par`, `/token`) and `direct_post`
@@ -171,14 +203,15 @@ the specs require, and also accept JSON for convenience.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/status/{id}` | Serve StatusList2021 credential |
-| `GET` | `/status/{id}/token` | Serve IETF Token Status List |
+| `GET` | `/status/{id}/token` | Serve IETF Token Status List as a signed `statuslist+jwt` |
 | `POST` | `/admin/status/revoke` | Revoke a credential *(requires `ADMIN_API_TOKEN`)* |
 | `POST` | `/admin/status/suspend` | Suspend a credential *(requires `ADMIN_API_TOKEN`)* |
 | `POST` | `/admin/status/reinstate` | Reinstate a credential *(requires `ADMIN_API_TOKEN`)* |
 
 Issued SD-JWT VCs carry a `status.status_list` claim pointing at
 `/status/revocation/token`, so a revocation actually applies to a specific
-credential rather than to an unallocated index.
+credential rather than to an unallocated index. Indices are allocated at random,
+so two credentials cannot be linked by consecutive positions in the list.
 
 ---
 
@@ -217,6 +250,13 @@ These are enforced and covered by tests, including negative tests:
 | Verifier sessions are single-use, so a presentation cannot be replayed | `verifier/response.rs` |
 | The DCQL query is evaluated — a presentation missing a requested claim is rejected | `verifier/response.rs` |
 | PKCE `S256` is required on the authorization code flow | `issuer/authorization.rs` |
+| The authorization code flow requires PAR; a `request_uri` is bound to its client, expires after 60 s, and is single-use | `issuer/authorization.rs`, `server/routes/issuer.rs` |
+| Wallets authenticate with OAuth 2.0 Attestation-Based Client Authentication; the attestation must come from a trusted attester and the PoP must be signed by its `cnf` key, with `jti` replay rejected | `issuer/client_attestation.rs` |
+| Access tokens are sender-constrained with DPoP (RFC 9449): `htm`/`htu`/`iat`/`ath` checked, `jti` replay rejected, key bound across PAR (`dpop_jkt`), token and credential requests | `issuer/dpop.rs`, `issuer/token.rs` |
+| Authorization codes live 60 s, are bound to client and `redirect_uri`, and a replayed code revokes the tokens it minted | `issuer/token.rs` |
+| The authorization response carries `iss` (RFC 9207) | `server/routes/issuer.rs` |
+| Credentials and status list tokens carry an `x5c` chain; the trust anchor is left out, per HAIP | `crypto/x509.rs` |
+| Credential time claims are rounded to the day (RFC 9901 §10.1), so batch-issued credentials cannot be correlated by timestamp | `crypto/sd_jwt.rs` |
 | Admin status endpoints require a bearer token, compared in constant time | `server/routes/status.rs` |
 
 ## What's Deliberately Not Implemented (and Why)
@@ -227,9 +267,9 @@ These are enforced and covered by tests, including negative tests:
 | **Wallet implementation** | Out of scope — this is the *issuer* and *verifier* side. Use the conformance suite's wallet emulator for testing. |
 | **Database persistence** | State management uses traits (`IssuerState`, `VerifierState`). The in-memory implementation ships by default; plug in PostgreSQL/Redis for production. |
 | **TLS termination** | Use a reverse proxy (nginx, Caddy) in production. The server listens on plain HTTP. |
-| **User authentication at `/authorize`** | The authorization endpoint grants immediately instead of authenticating a user and collecting consent. That belongs to the deployment's IdP. |
+| **User authentication at `/authorize`** | The authorization endpoint collects consent but does not log a user in. Authenticating the holder belongs to the deployment's IdP. |
 | **Issuer trust resolution** | The verifier verifies against this server's own issuer key. Resolving an arbitrary issuer via `did:web`/`x5c` and a trust list is not implemented. |
-| **Batch credential issuance** | Spec-compliant but not yet implemented. Single credential per request for now. |
+| **Credential response encryption** | Not implemented, so the conformance suite's encrypted-response variant does not apply. |
 
 ---
 
