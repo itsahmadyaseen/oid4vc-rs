@@ -104,7 +104,18 @@ jobs:
           curl -sf http://localhost:3000/.well-known/oauth-authorization-server | jq -e .token_endpoint
           curl -sf http://localhost:3000/.well-known/jwks.json | jq -e '.keys | length == 2'
           curl -sf http://localhost:3000/status/revocation | jq -e .credentialSubject
-          curl -sf http://localhost:3000/status/revocation/token | jq -e .status_list
+          # The Status List Token is a signed JWT (statuslist+jwt), not JSON:
+          # check the status list in its payload.
+          curl -sf http://localhost:3000/status/revocation/token \
+            | python3 -c 'import base64, sys; p = sys.stdin.read().split(".")[1]; sys.stdout.buffer.write(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))' \
+            | jq -e '.status_list.bits == 2'
+
+          # mdoc: the revocation list is a signed CWT, the CRL its document
+          # signer certificate names is served, and the mDL can be offered.
+          test "$(curl -sf -o /dev/null -w '%{content_type}' http://localhost:3000/status/mdoc)" = "application/statuslist+cwt"
+          test "$(curl -sf -o /dev/null -w '%{content_type}' http://localhost:3000/iaca.crl)" = "application/pkix-crl"
+          curl -sf 'http://localhost:3000/credential_offer?credential_configuration_id=mDL_mso_mdoc' \
+            | jq -e '.credential_offer.credential_configuration_ids == ["mDL_mso_mdoc"]'
 
           CODE=$(curl -sf http://localhost:3000/credential_offer \
             | jq -r '.credential_offer.grants["urn:ietf:params:oauth:grant-type:pre-authorized_code"]["pre-authorized_code"]')
