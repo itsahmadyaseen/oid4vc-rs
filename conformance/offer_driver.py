@@ -8,6 +8,8 @@ Environment:
   CONFORMANCE_SERVER  suite base URL (default https://localhost.emobix.co.uk:8443/)
   CONFORMANCE_TOKEN   API token, needed for the hosted suite
   ISSUER_URL          where to fetch offers (default http://localhost:3000)
+  CREDENTIAL_CONFIGURATION_ID  what to offer (default: the issuer's default,
+                      the SD-JWT VC); mDL_mso_mdoc for the mdoc plan
 """
 import json
 import os
@@ -19,6 +21,7 @@ import httpx
 SUITE = os.environ.get("CONFORMANCE_SERVER", "https://localhost.emobix.co.uk:8443/").rstrip("/") + "/"
 ISSUER = os.environ.get("ISSUER_URL", "http://localhost:3000").rstrip("/")
 TOKEN = os.environ.get("CONFORMANCE_TOKEN")
+CONFIG_ID = os.environ.get("CREDENTIAL_CONFIGURATION_ID")
 WAIT_MSG = "Waiting for call to credential offer endpoint"
 
 headers = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
@@ -50,7 +53,8 @@ while True:
             waits = sum(1 for e in entries if WAIT_MSG in str(e.get("msg", "")))
             if waits <= delivered.get(test_id, 0):
                 continue
-            offer = issuer.get(ISSUER + "/credential_offer").json()["credential_offer"]
+            params = {"credential_configuration_id": CONFIG_ID} if CONFIG_ID else {}
+            offer = issuer.get(ISSUER + "/credential_offer", params=params).json()["credential_offer"]
             url = endpoint + "?" + urllib.parse.urlencode({"credential_offer": json.dumps(offer)})
             response = suite.get(url, follow_redirects=False)
             delivered[test_id] = waits

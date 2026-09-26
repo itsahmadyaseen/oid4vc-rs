@@ -25,8 +25,11 @@ mkdir -p conformance/out
 cargo run --bin oid4vc-server   # stop it once it is listening
 ```
 
-The first start creates the signing key, mints a development CA, and writes the
-CA certificate to `conformance/out/ta.pem`.
+The first start creates the signing key and mints a development root with every
+certificate the issuer needs: the `x5c` leaf, and the mdoc document signer and
+revocation list signer. They are written to `conformance/out/issuer.pem` as one
+bundle, and the root to `conformance/out/ta.pem`. The root is also the mdoc IACA,
+so the same `ta.pem` serves both credential formats.
 
 ## 2. Generate the suite configs and start the issuer
 
@@ -76,6 +79,31 @@ the issuer and delivers it to the suite. Keep it running for the whole plan:
 
 ```bash
 ISSUER_URL=http://localhost:3000 python conformance/offer_driver.py
+```
+
+### mdoc (mDL)
+
+Generate the configs for the mDL and restart the issuer, since the attester key
+is regenerated:
+
+```bash
+python conformance/make_configs.py --issuer https://issuer.oid4vc.test --trust-anchor conformance/out/ta.pem --format mdoc
+CLIENT_ATTESTER_JWKS=conformance/out/attesters.jwks.json cargo run --bin oid4vc-server
+```
+
+This writes `issuer-haip-mdoc.json`, `issuer-haip-mdoc-deny.json` and
+`issuer-haip-mdoc-lookfirst.json`. Run the plan with `credential_format=mdoc`,
+using them in place of the SD-JWT VC configs:
+
+```bash
+PLAN='oid4vci-1_0-issuer-haip-test-plan[vci_authorization_code_flow_variant=wallet_initiated][credential_format=mdoc]'
+python scripts/run-test-plan.py "$PLAN" /path/to/conformance/out/issuer-haip-mdoc.json
+```
+
+For the issuer-initiated variant, have the offer driver offer the mDL:
+
+```bash
+CREDENTIAL_CONFIGURATION_ID=mDL_mso_mdoc ISSUER_URL=http://localhost:3000 python conformance/offer_driver.py
 ```
 
 ## Against the hosted suite

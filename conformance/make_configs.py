@@ -7,11 +7,16 @@ Writes into ./out (git-ignored):
   issuer-haip-deny.json     for fapi2-security-profile-final-user-rejects-authentication
   issuer-haip-lookfirst.json for fapi2-security-profile-final-par-ensure-reused-request-uri-prior-to-auth-completion-succeeds
 
-All keys are generated fresh for the run and are test-only.
+With --format mdoc the configs ask for the mDL instead, and are named
+issuer-haip-mdoc*.json. The trust anchor is the same file either way: the
+development root is also the mdoc IACA.
+
+All keys are generated fresh for the run and are test-only, so the attester
+trust list is rewritten each time: generate for the format you are about to run.
 
 Usage:
   python make_configs.py --issuer https://issuer.example --trust-anchor ta.pem \
-      [--suite https://localhost.emobix.co.uk:8443] [--alias oid4vc-rs]
+      [--format sd-jwt|mdoc] [--suite https://localhost.emobix.co.uk:8443] [--alias oid4vc-rs]
 """
 import argparse
 import base64
@@ -28,6 +33,13 @@ from cryptography.x509.oid import NameOID
 
 def b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+# credential_configuration_id, scope, config file suffix
+FORMATS = {
+    "sd-jwt": ("IdentityCredential_SD_JWT_VC", "identity_credential", ""),
+    "mdoc": ("mDL_mso_mdoc", "org.iso.18013.5.1.mDL", "-mdoc"),
+}
 
 
 def private_jwk(key: ec.EllipticCurvePrivateKey, kid: str) -> dict:
@@ -63,10 +75,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--issuer", required=True, help="the issuer's EXTERNAL_URL")
     parser.add_argument("--trust-anchor", required=True, help="the issuer's ISSUER_TRUST_ANCHOR_PEM")
+    parser.add_argument("--format", choices=FORMATS, default="sd-jwt")
     parser.add_argument("--suite", default="https://localhost.emobix.co.uk:8443")
     parser.add_argument("--alias", default="oid4vc-rs")
     args = parser.parse_args()
 
+    config_id, scope, suffix = FORMATS[args.format]
     out = pathlib.Path(__file__).parent / "out"
     out.mkdir(exist_ok=True)
     issuer = args.issuer.rstrip("/")
@@ -84,12 +98,12 @@ def main() -> None:
     }
     config = {
         "alias": args.alias,
-        "description": "oid4vc-rs issuer, HAIP",
+        "description": f"oid4vc-rs issuer, HAIP, {args.format}",
         "server": {"discoveryUrl": issuer + "/.well-known/oauth-authorization-server"},
-        "vci": {"credential_issuer_url": issuer, "credential_configuration_id": "IdentityCredential_SD_JWT_VC"},
-        "client": {"client_id": "oid4vc-rs-test-wallet-1", "scope": "identity_credential",
+        "vci": {"credential_issuer_url": issuer, "credential_configuration_id": config_id},
+        "client": {"client_id": "oid4vc-rs-test-wallet-1", "scope": scope,
                    "jwks": {"keys": [private_jwk(ec.generate_private_key(ec.SECP256R1()), "wallet-1")]}},
-        "client2": {"client_id": "oid4vc-rs-test-wallet-2", "scope": "identity_credential",
+        "client2": {"client_id": "oid4vc-rs-test-wallet-2", "scope": scope,
                     "jwks": {"keys": [private_jwk(ec.generate_private_key(ec.SECP256R1()), "wallet-2")]}},
         "client_attestation": {"issuer": "https://attester.oid4vc.test", "attester_jwks": {"keys": [att]}},
         "credential": {"trust_anchor_pem": ta, "status_list_trust_anchor_pem": ta},
@@ -107,14 +121,14 @@ def main() -> None:
         }],
         "options": {"browsercontrol_css_enable": False},
     }
-    (out / "issuer-haip.json").write_text(json.dumps(config, indent=1))
+    (out / f"issuer-haip{suffix}.json").write_text(json.dumps(config, indent=1))
 
     deny = copy.deepcopy(config)
     deny["browser"][0]["tasks"] = [
         {"task": "Deny", "match": authorize, "optional": True, "commands": [["click", "id", "deny"]]},
         verify_complete,
     ]
-    (out / "issuer-haip-deny.json").write_text(json.dumps(deny, indent=1))
+    (out / f"issuer-haip{suffix}-deny.json").write_text(json.dumps(deny, indent=1))
 
     # The reuse-before-completion test visits the authorization endpoint twice and
     # expects the user to act only on the second visit.
@@ -124,7 +138,7 @@ def main() -> None:
         "match": authorize, "match-limit": 1,
         "tasks": [{"task": "Look only", "match": authorize, "optional": True}],
     })
-    (out / "issuer-haip-lookfirst.json").write_text(json.dumps(lookfirst, indent=1))
+    (out / f"issuer-haip{suffix}-lookfirst.json").write_text(json.dumps(lookfirst, indent=1))
 
     print(f"wrote configs and attester trust list to {out}")
 

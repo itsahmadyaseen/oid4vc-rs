@@ -11,14 +11,18 @@ A Rust implementation of **OpenID for Verifiable Credential Issuance (OID4VCI 1.
 ## Conformance Results
 
 The issuer was run against the [OpenID Foundation conformance suite](https://gitlab.com/openid/conformance-suite)
-v5.3.1, self-hosted, on 2026-09-25. Plan: `oid4vci-1_0-issuer-haip-test-plan`,
-SD-JWT VC, 63 test modules per variant.
+v5.3.1, self-hosted. Plan: `oid4vci-1_0-issuer-haip-test-plan`, 63 test modules
+per variant, once for each credential format.
 
-| Test Plan | Variant | Date | Passed | Review | Skipped | Failed |
-|-----------|---------|------|--------|--------|---------|--------|
-| OID4VCI 1.0 Issuer, HAIP 1.0 | wallet-initiated authorization code | 2026-09-25 | 55 | 2 | 6 | 0 |
-| OID4VCI 1.0 Issuer, HAIP 1.0 | issuer-initiated authorization code | 2026-09-25 | 55 | 2 | 6 | 0 |
-| OID4VP 1.0 Verifier, HAIP 1.0 | — | *not yet run* | — | — | — | — |
+| Test Plan | Format | Variant | Date | Passed | Review | Skipped | Failed |
+|-----------|--------|---------|------|--------|--------|---------|--------|
+| OID4VCI 1.0 Issuer, HAIP 1.0 | SD-JWT VC | wallet-initiated authorization code | 2026-09-25 | 55 | 2 | 6 | 0 |
+| OID4VCI 1.0 Issuer, HAIP 1.0 | SD-JWT VC | issuer-initiated authorization code | 2026-09-25 | 55 | 2 | 6 | 0 |
+| OID4VCI 1.0 Issuer, HAIP 1.0 | mdoc (mDL) | wallet-initiated authorization code | 2026-09-26 | 55 | 2 | 6 | 0 |
+| OID4VCI 1.0 Issuer, HAIP 1.0 | mdoc (mDL) | issuer-initiated authorization code | 2026-09-26 | 55 | 2 | 6 | 0 |
+| OID4VP 1.0 Verifier, HAIP 1.0 | — | — | *not yet run* | — | — | — | — |
+
+The same modules land in review and skipped for both formats:
 
 - **Review** — `…-without-using-par-fails` and `…-request_uri-for-different-client`.
   The issuer refuses these requests with an error page rather than redirecting,
@@ -31,6 +35,15 @@ SD-JWT VC, 63 test modules per variant.
   `…-user-rejects-authentication` clicks *Deny*, and
   `…-reused-request-uri-prior-to-auth-completion-succeeds` takes no action on the
   first visit. They were run on their own with those scripts, and both pass.
+- For the mDL, the suite also checks the credential itself, and every check
+  passes with no warnings: the MSO signature and each element's digest, the
+  document signer and IACA certificate profiles (ISO/IEC 18013-5 Annex B),
+  `issuing_country` against the certificate, the MSO validity period, the
+  device key against the proof key, every mandatory mDL element and its
+  encoding, `age_over_NN` against `birth_date`, and the signed revocation list
+  and its certificate chain. In a batch, all copies carry the same data and no
+  precise timestamp. The IACA root is given to the suite directly, not through a
+  VICAL, so the suite's VICAL checks do not run.
 
 These are self-run results, not an OpenID Foundation certification. The run
 harness is in [`conformance/`](conformance/), so they can be reproduced.
@@ -56,7 +69,7 @@ graph TB
         end
 
         subgraph "Foundations"
-            CRYPTO["oid4vc-crypto<br/>ES256 · EdDSA · SD-JWT · COSE"]
+            CRYPTO["oid4vc-crypto<br/>ES256 · EdDSA · SD-JWT · COSE · mdoc · X.509"]
             TYPES["oid4vc-types<br/>Shared domain types"]
         end
     end
@@ -81,7 +94,7 @@ graph TB
 | Format | Status | Spec |
 |--------|--------|------|
 | **SD-JWT VC** | ✅ Implemented | [RFC 9901](https://datatracker.ietf.org/doc/rfc9901/) |
-| **ISO 18013-5 mdoc** | ◐ Partial — COSE_Sign1 + MSO digests | [ISO/IEC 18013-5](https://www.iso.org/standard/69084.html) |
+| **ISO 18013-5 mdoc** (mDL) | ✅ Issued over OID4VCI; presentation and verification in `oid4vc-crypto`, not yet wired into the verifier endpoint | [ISO/IEC 18013-5](https://www.iso.org/standard/69084.html) |
 | JWT-VC | ○ Planned | [W3C VC Data Model](https://www.w3.org/TR/vc-data-model-2.0/) |
 
 ---
@@ -98,6 +111,8 @@ graph TB
 | PAR | [RFC 9126](https://datatracker.ietf.org/doc/rfc9126/) |
 | Attestation-Based Client Authentication | [draft-ietf-oauth-attestation-based-client-auth](https://datatracker.ietf.org/doc/draft-ietf-oauth-attestation-based-client-auth/) |
 | SD-JWT | [RFC 9901](https://datatracker.ietf.org/doc/rfc9901/) |
+| mdoc, mDL | [ISO/IEC 18013-5:2021](https://www.iso.org/standard/69084.html), with OID4VCI 1.0 Appendix A.2 and OID4VP 1.0 Appendix B.2 |
+| COSE | [RFC 9052](https://datatracker.ietf.org/doc/rfc9052/) |
 | DCQL | OID4VP 1.0 §5.3 |
 | StatusList2021 | [W3C v1.0](https://www.w3.org/TR/vc-status-list/) |
 | Token Status List | [draft-ietf-oauth-status-list](https://datatracker.ietf.org/doc/draft-ietf-oauth-status-list/) |
@@ -153,8 +168,8 @@ with PAR, client attestation and DPoP.
 | `EXTERNAL_URL` | `http://localhost:{port}` | Credential Issuer identifier; the `aud` wallets must use |
 | `ISSUER_KEY_P256_PEM` | *(unset)* | P-256 signing key, created on first start. Unset means ephemeral keys, and credentials stop verifying after a restart |
 | `ISSUER_KEY_ED25519_PEM` | *(unset)* | Ed25519 signing key |
-| `ISSUER_CERT_PEM` | *(unset)* | X.509 certificate for the P-256 key, sent as the `x5c` header on credentials and status list tokens. If the file is missing, a development CA and leaf are minted and written here |
-| `ISSUER_TRUST_ANCHOR_PEM` | *(unset)* | Where a minted development CA certificate is written, for relying parties to trust. Unset means it is printed to the log |
+| `ISSUER_CERT_PEM` | *(unset)* | The P-256 key's certificates, as one PEM bundle: the `x5c` leaf for SD-JWT VCs and their status lists, the mdoc document signer, the mdoc revocation list signer, the root they chain to, and the root's CRL. If the file is missing, a development root and all of these are minted and written here |
+| `ISSUER_TRUST_ANCHOR_PEM` | *(unset)* | Where a minted development root is written, for relying parties to trust. It is also the mdoc IACA root. Unset means it is printed to the log |
 | `CLIENT_ATTESTER_JWKS` | *(unset)* | JWKS of trusted wallet attesters. The authorization code flow requires OAuth 2.0 Attestation-Based Client Authentication, so unset means every wallet is rejected there |
 | `ADMIN_API_TOKEN` | *(generated)* | Bearer token for `/admin/status/*`. A generated one is written to the log at startup |
 | `CREDENTIAL_ISSUER_NAME` | `OID4VC-RS Development Issuer` | Display name in metadata |
@@ -184,7 +199,7 @@ curl http://localhost:3000/.well-known/openid-credential-issuer | jq .
 | `POST` | `/token` | Token endpoint (auth code + pre-auth code), DPoP-bound tokens |
 | `POST` | `/nonce` | Nonce endpoint — a fresh single-use `c_nonce` |
 | `POST` | `/credential` | Credential endpoint (SD-JWT VC, mdoc), batch via `proofs.jwt[]` |
-| `GET` | `/credential_offer` | Generate a credential offer |
+| `GET` | `/credential_offer` | Generate a credential offer; `?credential_configuration_id=mDL_mso_mdoc` offers the mDL |
 
 The OAuth endpoints (`/authorize/par`, `/token`) and `direct_post`
 (`/verifier/response`) accept `application/x-www-form-urlencoded`, which is what
@@ -204,7 +219,9 @@ the specs require, and also accept JSON for convenience.
 |--------|------|-------------|
 | `GET` | `/status/{id}` | Serve StatusList2021 credential |
 | `GET` | `/status/{id}/token` | Serve IETF Token Status List as a signed `statuslist+jwt` |
-| `POST` | `/admin/status/revoke` | Revoke a credential *(requires `ADMIN_API_TOKEN`)* |
+| `GET` | `/status/mdoc` | Serve the mdoc revocation list: a Status List Token in CWT format (`application/statuslist+cwt`) |
+| `GET` | `/iaca.crl` | Serve the root's CRL, named by the mdoc document signer certificate |
+| `POST` | `/admin/status/revoke` | Revoke a credential; send `"format": "mso_mdoc"` for an mdoc *(requires `ADMIN_API_TOKEN`)* |
 | `POST` | `/admin/status/suspend` | Suspend a credential *(requires `ADMIN_API_TOKEN`)* |
 | `POST` | `/admin/status/reinstate` | Reinstate a credential *(requires `ADMIN_API_TOKEN`)* |
 
@@ -212,6 +229,11 @@ Issued SD-JWT VCs carry a `status.status_list` claim pointing at
 `/status/revocation/token`, so a revocation actually applies to a specific
 credential rather than to an unallocated index. Indices are allocated at random,
 so two credentials cannot be linked by consecutive positions in the list.
+
+Issued mdocs carry the MSO `status.status_list` entry instead, pointing at
+`/status/mdoc`. ISO/IEC 18013-5 requires that list to have one bit per mdoc, so
+it is separate from the 2-bit lists above, and an mdoc can be revoked but not
+suspended.
 
 ---
 
@@ -221,7 +243,7 @@ so two credentials cannot be linked by consecutive positions in the list.
 oid4vc-rs/
 ├── crates/
 │   ├── types/       # Shared domain types (OID4VCI, OID4VP, credentials, status, errors)
-│   ├── crypto/      # ECDSA P-256, Ed25519, JWS, SD-JWT, COSE_Sign1, JWK
+│   ├── crypto/      # ECDSA P-256, Ed25519, JWS, SD-JWT, COSE, mdoc, X.509, JWK
 │   ├── issuer/      # OID4VCI issuer logic (metadata, offer, auth, token, credential)
 │   ├── verifier/    # OID4VP verifier logic (request, response, DCQL, session)
 │   ├── status/      # StatusList2021 + IETF Token Status List management
@@ -256,6 +278,10 @@ These are enforced and covered by tests, including negative tests:
 | Authorization codes live 60 s, are bound to client and `redirect_uri`, and a replayed code revokes the tokens it minted | `issuer/token.rs` |
 | The authorization response carries `iss` (RFC 9207) | `server/routes/issuer.rs` |
 | Credentials and status list tokens carry an `x5c` chain; the trust anchor is left out, per HAIP | `crypto/x509.rs` |
+| An mdoc's MSO names the proof key as its device key, so only the holder can present it | `issuer/credential.rs` |
+| Every mdoc element is covered by a salted SHA-256 digest in the signed MSO, under random digest IDs; a verifier re-hashes each revealed element | `crypto/mdoc.rs` |
+| An mdoc presentation is signed by the device key over the OID4VP session transcript (`client_id`, `nonce`, `response_uri`), so it cannot be replayed to another request | `crypto/mdoc.rs` |
+| The MSO is signed under a document signer certificate following ISO/IEC 18013-5 Annex B, which chains to an IACA root and outlives every MSO it signs | `crypto/x509.rs`, `issuer/credential.rs` |
 | Credential time claims are rounded to the day (RFC 9901 §10.1), so batch-issued credentials cannot be correlated by timestamp | `crypto/sd_jwt.rs` |
 | Admin status endpoints require a bearer token, compared in constant time | `server/routes/status.rs` |
 
